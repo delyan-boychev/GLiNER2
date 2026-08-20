@@ -1351,6 +1351,94 @@ class SchemaTransformer:
             return self._extract_embeddings_fast(token_embeddings, batch)
         return self._extract_embeddings_loop(token_embeddings, input_ids, batch)
 
+    def extract_embeddings_from_unpadded_batch(
+            self,
+            token_embeddings: List[torch.Tensor],
+            input_ids: torch.Tensor,
+            batch: PreprocessedBatch
+    ) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
+        """Extract routed embeddings from exact-length encoder outputs.
+
+        Sequence packing returns one ``[encoded_length, hidden]`` tensor per
+        original request.  Keeping that representation exact avoids inventing
+        encoder states for unencoded padding and lets all existing task heads
+        remain unaware that packing occurred.
+        """
+        if len(token_embeddings) != len(batch):
+            raise ValueError(
+                "unpacked encoder result count does not match preprocessed batch"
+            )
+        for i, embeddings in enumerate(token_embeddings):
+            if embeddings.ndim != 2:
+                raise ValueError("each unpacked encoder result must have shape [sequence, hidden]")
+            if embeddings.shape[0] != batch.original_lengths[i]:
+                raise ValueError(
+                    f"unpacked encoder length for request {i} is {embeddings.shape[0]}, "
+                    f"expected {batch.original_lengths[i]}"
+                )
+
+        if (self.token_pooling == "first"
+                and batch.text_word_indices is not None
+                and batch.schema_special_indices is not None):
+            all_token_embs = []
+            all_schema_embs = []
+            for i, embeddings in enumerate(token_embeddings):
+                n_words = batch.text_word_counts[i]
+                if n_words > 0:
+                    indices = batch.text_word_indices[i, :n_words]
+                    if int(indices.max()) >= embeddings.shape[0]:
+                        raise AssertionError("text routing index exceeds unpacked sequence")
+                    word_embs = embeddings[indices]
+                else:
+                    word_embs = embeddings.new_empty((0, embeddings.shape[-1]))
+                all_token_embs.append(word_embs)
+
+                schema_embs = []
+                for j in range(batch.schema_counts[i]):
+                    positions = batch.schema_special_indices[i][j]
+                    if positions and max(positions) >= embeddings.shape[0]:
+                        raise AssertionError("schema routing index exceeds unpacked sequence")
+                    schema_embs.append([embeddings[position] for position in positions])
+                all_schema_embs.append(schema_embs)
+            return all_token_embs, all_schema_embs
+
+        # Mean/max pooling keeps the existing mapping semantics, operating on
+        # each exact segment instead of reconstructing a padded hidden tensor.
+        all_token_embs = []
+        all_schema_embs = []
+        special_ids = self._special_ids
+        for i, embeddings in enumerate(token_embeddings):
+            seq_len = batch.original_lengths[i]
+            ids = input_ids[i, :seq_len].tolist()
+            mappings = batch.mapped_indices[i][:seq_len]
+            schema_embs = [[] for _ in range(batch.schema_counts[i])]
+            word_embs = []
+            bucket = []
+            last_orig = None
+
+            for j, tid in enumerate(ids):
+                seg_type, orig_idx, schema_idx = mappings[j]
+                embedding = embeddings[j]
+                if seg_type == "schema":
+                    if tid in special_ids:
+                        schema_embs[schema_idx].append(embedding)
+                elif seg_type == "text":
+                    if last_orig is not None and orig_idx != last_orig and bucket:
+                        word_embs.append(self._aggregate(bucket))
+                        bucket = []
+                    bucket.append(embedding)
+                    last_orig = orig_idx
+            if bucket:
+                word_embs.append(self._aggregate(bucket))
+
+            all_token_embs.append(
+                torch.stack(word_embs)
+                if word_embs
+                else embeddings.new_empty((0, embeddings.shape[-1]))
+            )
+            all_schema_embs.append(schema_embs)
+        return all_token_embs, all_schema_embs
+
     def _extract_embeddings_fast(
             self,
             token_embeddings: torch.Tensor,

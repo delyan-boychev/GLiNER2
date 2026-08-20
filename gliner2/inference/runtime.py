@@ -32,6 +32,11 @@ from gliner2.processor import PreprocessedBatch
 from gliner2.inference.chunking import merge_chunk_results, split_text_into_chunks
 from gliner2.training.trainer import ExtractorCollator
 from gliner2.inference.candidate_decoder import finalize_spans
+from gliner2.inference.packing import (
+    PackingConfig,
+    PackingStats,
+    encode_batch_with_packing,
+)
 
 if TYPE_CHECKING:
     from gliner2.api_client import GLiNER2API
@@ -77,10 +82,15 @@ class ExtractorRuntimeMixin:
         include_spans: bool = False,
         max_len: Optional[int] = None,
         overlap_policy: Optional[str] = None,
+        packing_config: Optional[PackingConfig] = None,
     ) -> List[Dict[str, Any]]:
-        """Extract from multiple texts with parallel preprocessing."""
+        """Extract from multiple texts with optional encoder sequence packing."""
         if not texts:
             return []
+
+        packing_config = packing_config or PackingConfig()
+        if not isinstance(packing_config, PackingConfig):
+            raise TypeError("packing_config must be a PackingConfig instance or None")
 
         self.eval()
         self.processor.change_mode(is_training=False)
@@ -129,7 +139,7 @@ class ExtractorRuntimeMixin:
             batch = batch.to(device, dtype if dtype != torch.float32 else None)
             batch_results = self._extract_from_batch(
                 batch, threshold, metadata_list[sample_idx:sample_idx + len(batch)],
-                include_confidence, include_spans
+                include_confidence, include_spans, packing_config=packing_config
             )
 
             if format_results:
@@ -214,16 +224,46 @@ class ExtractorRuntimeMixin:
         metadata_list: List[Dict],
         include_confidence: bool,
         include_spans: bool,
+        packing_config: Optional[PackingConfig] = None,
     ) -> List[Dict[str, Any]]:
         """Extract from preprocessed batch (span architecture path)."""
-        all_token_embs, all_schema_embs = self.processor.extract_embeddings_from_batch(
-            self.encoder(
-                input_ids=batch.input_ids,
-                attention_mask=batch.attention_mask
-            ).last_hidden_state,
-            batch.input_ids,
-            batch
-        )
+        packing_config = packing_config or PackingConfig()
+        if packing_config.enabled:
+            pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+            encoded_hidden, packing_stats = encode_batch_with_packing(
+                self.encoder,
+                batch.input_ids,
+                batch.attention_mask,
+                packing_config,
+                pad_token_id=0 if pad_token_id is None else int(pad_token_id),
+                return_padded_fallback=True,
+            )
+            self._last_packing_stats = packing_stats
+            if packing_stats.activated:
+                all_token_embs, all_schema_embs = (
+                    self.processor.extract_embeddings_from_unpadded_batch(
+                        encoded_hidden, batch.input_ids, batch
+                    )
+                )
+            else:
+                all_token_embs, all_schema_embs = self.processor.extract_embeddings_from_batch(
+                    encoded_hidden, batch.input_ids, batch
+                )
+        else:
+            self._last_packing_stats = PackingStats(
+                activated=False,
+                reason="disabled",
+                original_count=len(batch),
+                fallback_count=len(batch),
+            )
+            all_token_embs, all_schema_embs = self.processor.extract_embeddings_from_batch(
+                self.encoder(
+                    input_ids=batch.input_ids,
+                    attention_mask=batch.attention_mask
+                ).last_hidden_state,
+                batch.input_ids,
+                batch
+            )
 
         # Build every span task's count-aware query vectors first, concatenate
         # them per sample, then run one factorized span-scoring pass per model
@@ -1165,12 +1205,14 @@ class ExtractorRuntimeMixin:
     def extract(self, text: str, schema, threshold: float = 0.5,
                 format_results: bool = True, include_confidence: bool = False,
                 include_spans: bool = False, max_len: Optional[int] = None,
-                overlap_policy: Optional[str] = None) -> Dict:
+                overlap_policy: Optional[str] = None,
+                packing_config: Optional[PackingConfig] = None) -> Dict:
         """Extract from single text."""
         return self.batch_extract(
             [text], schema, 1, threshold, 0, format_results,
             include_confidence, include_spans, max_len=max_len,
             overlap_policy=overlap_policy,
+            packing_config=packing_config,
         )[0]
 
     def extract_long(
@@ -1186,6 +1228,7 @@ class ExtractorRuntimeMixin:
         include_confidence: bool = False,
         include_spans: bool = False,
         overlap_policy: Optional[str] = None,
+        packing_config: Optional[PackingConfig] = None,
     ) -> Dict:
         """Extract from a long document with overlapping word chunks."""
         return self.batch_extract_long(
@@ -1200,6 +1243,7 @@ class ExtractorRuntimeMixin:
             overlap_policy=overlap_policy,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            packing_config=packing_config,
         )[0]
 
     def batch_extract_long(
@@ -1215,6 +1259,7 @@ class ExtractorRuntimeMixin:
         chunk_size: int = 384,
         chunk_overlap: int = 64,
         overlap_policy: Optional[str] = None,
+        packing_config: Optional[PackingConfig] = None,
     ) -> List[Dict[str, Any]]:
         """Extract from long documents by scanning overlapping word chunks."""
         if not format_results:
@@ -1253,6 +1298,7 @@ class ExtractorRuntimeMixin:
             include_spans=True,
             max_len=chunk_size,
             overlap_policy=overlap_policy,
+            packing_config=packing_config,
         )
 
         merged_results: List[Dict[str, Any]] = []
@@ -1287,12 +1333,13 @@ class ExtractorRuntimeMixin:
 
     def extract_entities(self, text: str, entity_types, threshold: float = 0.5,
                         format_results: bool = True, include_confidence: bool = False,
-                        include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                        include_spans: bool = False, max_len: Optional[int] = None,
+                        packing_config: Optional[PackingConfig] = None) -> Dict:
         """Extract entities from text."""
         schema = self.create_schema().entities(entity_types)
         return self.extract(
             text, schema, threshold, format_results, include_confidence,
-            include_spans, max_len=max_len,
+            include_spans, max_len=max_len, packing_config=packing_config,
         )
 
     def extract_entities_long(
@@ -1307,6 +1354,8 @@ class ExtractorRuntimeMixin:
         format_results: bool = True,
         include_confidence: bool = False,
         include_spans: bool = False,
+        overlap_policy: Optional[str] = None,
+        packing_config: Optional[PackingConfig] = None,
     ) -> Dict:
         """Extract entities from a long document with overlapping word chunks."""
         schema = self.create_schema().entities(entity_types)
@@ -1322,17 +1371,20 @@ class ExtractorRuntimeMixin:
             include_confidence=include_confidence,
             include_spans=include_spans,
             overlap_policy=overlap_policy,
+            packing_config=packing_config,
         )
 
     def batch_extract_entities(self, texts: List[str], entity_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
                                include_confidence: bool = False, include_spans: bool = False,
-                               max_len: Optional[int] = None) -> List[Dict]:
+                               max_len: Optional[int] = None,
+                               packing_config: Optional[PackingConfig] = None) -> List[Dict]:
         """Batch extract entities."""
         schema = self.create_schema().entities(entity_types)
         return self.batch_extract(
             texts, schema, batch_size, threshold, 0, format_results,
             include_confidence, include_spans, max_len=max_len,
+            packing_config=packing_config,
         )
 
     def batch_extract_entities_long(
@@ -1347,6 +1399,8 @@ class ExtractorRuntimeMixin:
         include_spans: bool = False,
         chunk_size: int = 384,
         chunk_overlap: int = 64,
+        overlap_policy: Optional[str] = None,
+        packing_config: Optional[PackingConfig] = None,
     ) -> List[Dict]:
         """Batch extract entities from long documents with overlapping word chunks."""
         schema = self.create_schema().entities(entity_types)
@@ -1359,13 +1413,16 @@ class ExtractorRuntimeMixin:
             format_results=format_results,
             include_confidence=include_confidence,
             include_spans=include_spans,
+            overlap_policy=overlap_policy,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            packing_config=packing_config,
         )
 
     def classify_text(self, text: str, tasks: Dict, threshold: float = 0.5,
                      format_results: bool = True, include_confidence: bool = False,
-                     include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                     include_spans: bool = False, max_len: Optional[int] = None,
+                     packing_config: Optional[PackingConfig] = None) -> Dict:
         """Classify text."""
         schema = self.create_schema()
         for name, config in tasks.items():
@@ -1375,12 +1432,16 @@ class ExtractorRuntimeMixin:
                 schema.classification(name, labels, **cfg)
             else:
                 schema.classification(name, config)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.extract(
+            text, schema, threshold, format_results, include_confidence,
+            include_spans, max_len=max_len, packing_config=packing_config,
+        )
 
     def batch_classify_text(self, texts: List[str], tasks: Dict, batch_size: int = 8,
                            threshold: float = 0.5, format_results: bool = True,
                            include_confidence: bool = False, include_spans: bool = False,
-                           max_len: Optional[int] = None) -> List[Dict]:
+                           max_len: Optional[int] = None,
+                           packing_config: Optional[PackingConfig] = None) -> List[Dict]:
         """Batch classify texts."""
         schema = self.create_schema()
         for name, config in tasks.items():
@@ -1390,11 +1451,16 @@ class ExtractorRuntimeMixin:
                 schema.classification(name, labels, **cfg)
             else:
                 schema.classification(name, config)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.batch_extract(
+            texts, schema, batch_size, threshold, 0, format_results,
+            include_confidence, include_spans, max_len=max_len,
+            packing_config=packing_config,
+        )
 
     def extract_json(self, text: str, structures: Dict, threshold: float = 0.5,
                     format_results: bool = True, include_confidence: bool = False,
-                    include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                    include_spans: bool = False, max_len: Optional[int] = None,
+                    packing_config: Optional[PackingConfig] = None) -> Dict:
         """Extract structured data."""
         schema = self.create_schema()
         for parent, fields in structures.items():
@@ -1402,12 +1468,16 @@ class ExtractorRuntimeMixin:
             for spec in fields:
                 name, dtype, choices, desc = self._parse_field_spec(spec)
                 builder.field(name, dtype=dtype, choices=choices, description=desc)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.extract(
+            text, schema, threshold, format_results, include_confidence,
+            include_spans, max_len=max_len, packing_config=packing_config,
+        )
 
     def batch_extract_json(self, texts: List[str], structures: Dict, batch_size: int = 8,
                           threshold: float = 0.5, format_results: bool = True,
                           include_confidence: bool = False, include_spans: bool = False,
-                          max_len: Optional[int] = None) -> List[Dict]:
+                          max_len: Optional[int] = None,
+                          packing_config: Optional[PackingConfig] = None) -> List[Dict]:
         """Batch extract structured data."""
         schema = self.create_schema()
         for parent, fields in structures.items():
@@ -1415,22 +1485,35 @@ class ExtractorRuntimeMixin:
             for spec in fields:
                 name, dtype, choices, desc = self._parse_field_spec(spec)
                 builder.field(name, dtype=dtype, choices=choices, description=desc)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.batch_extract(
+            texts, schema, batch_size, threshold, 0, format_results,
+            include_confidence, include_spans, max_len=max_len,
+            packing_config=packing_config,
+        )
 
     def extract_relations(self, text: str, relation_types, threshold: float = 0.5,
                          format_results: bool = True, include_confidence: bool = False,
-                         include_spans: bool = False, max_len: Optional[int] = None) -> Dict:
+                         include_spans: bool = False, max_len: Optional[int] = None,
+                         packing_config: Optional[PackingConfig] = None) -> Dict:
         """Extract relations."""
         schema = self.create_schema().relations(relation_types)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.extract(
+            text, schema, threshold, format_results, include_confidence,
+            include_spans, max_len=max_len, packing_config=packing_config,
+        )
 
     def batch_extract_relations(self, texts: List[str], relation_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
                                include_confidence: bool = False, include_spans: bool = False,
-                               max_len: Optional[int] = None) -> List[Dict]:
+                               max_len: Optional[int] = None,
+                               packing_config: Optional[PackingConfig] = None) -> List[Dict]:
         """Batch extract relations."""
         schema = self.create_schema().relations(relation_types)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, max_len=max_len)
+        return self.batch_extract(
+            texts, schema, batch_size, threshold, 0, format_results,
+            include_confidence, include_spans, max_len=max_len,
+            packing_config=packing_config,
+        )
 
     def _parse_field_spec(self, spec: Union[str, Dict]) -> Tuple[str, str, Optional[List[str]], Optional[str]]:
         """Parse field specification string or dictionary."""

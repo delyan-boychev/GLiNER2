@@ -22,6 +22,7 @@ _LAZY = {
     "AutoExtractor":            ("gliner2.auto",                      "AutoExtractor"),
     "SpanExtractor":            ("gliner2.inference.engine",          "SpanExtractor"),
     "BoundaryExtractor":        ("gliner2.inference.engine",          "BoundaryExtractor"),
+    "PackingConfig":            ("gliner2.inference.packing",         "PackingConfig"),
     "UnknownArchitectureError": ("gliner2.auto",                      "UnknownArchitectureError"),
     "ArchitectureMismatchError": ("gliner2.auto",                     "ArchitectureMismatchError"),
     "ArchitectureRegistrationError": ("gliner2.auto",                 "ArchitectureRegistrationError"),

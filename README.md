@@ -876,6 +876,26 @@ results = extractor.batch_extract_entities(
 )
 # Returns list of results, one per input text
 
+# Optional correctness-first encoder sequence packing. It is disabled by
+# default and activates only when the batch shape passes the cost/fill gate.
+from gliner2 import PackingConfig
+
+packing = PackingConfig(
+    enabled=True,
+    max_packed_length=512,
+    max_segments_per_stream=32,
+    strategy="best_fit",
+    attention_backend="dense_block",
+    overflow="fallback",
+)
+
+results = extractor.batch_extract_entities(
+    texts,
+    ["company", "person", "product", "location"],
+    batch_size=32,
+    packing_config=packing,
+)
+
 # Batch relation extraction
 texts = [
     "John works for Microsoft and lives in Seattle.",
@@ -899,6 +919,25 @@ results = extractor.batch_extract_entities(
     include_spans=True,
     batch_size=8
 )
+```
+
+Packing happens after the existing tokenization and `max_len`/chunking logic,
+so it never truncates a record. Records whose encoded sequence exceeds
+`max_packed_length` use the ordinary encoder path by default. The current
+backend supports the official Transformers DeBERTa-v2/v3 implementation with
+convolution disabled; unsupported encoders and FlashDeberta safely use normal
+batching. Dense block packing is most useful for short, strongly uneven
+batches. Uniform, single-document, and uneconomic batches remain unpacked.
+
+The most recent model-batch decision is available as
+`extractor._last_packing_stats` for benchmarking and rollout diagnostics.
+Packing stays opt-in while the CUDA and reduced-precision validation matrix is
+completed. MPS packing currently requires FP32; measured MPS FP16 parity was
+outside the acceptance tolerance and therefore safely falls back to ordinary
+batching. The benchmark harness supports `--device cpu`, `mps`, or `cuda`:
+
+```bash
+python benchmarks/benchmark_sequence_packing.py --device mps
 ```
 
 ## 🎓 Training Custom Models

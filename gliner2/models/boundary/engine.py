@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import bisect
+import logging
 from collections import OrderedDict
 from typing import Any, Dict, List, Tuple
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 from gliner2.inference.candidate_decoder import token_boundaries_to_character_offsets
 from gliner2.inference.runtime import ExtractorRuntimeMixin
+from gliner2.inference.packing import PackingConfig, PackingStats
 from gliner2.models.boundary.model import (
     BoundaryExtractorModel,
     _group_scored_candidates,
@@ -95,7 +99,21 @@ class BoundaryExtractor(ExtractorRuntimeMixin, BoundaryExtractorModel):
         metadata_list: List[Dict],
         include_confidence: bool,
         include_spans: bool,
+        packing_config: PackingConfig = None,
     ) -> List[Dict[str, Any]]:
+        if packing_config is not None and packing_config.enabled:
+            if not getattr(self, "_packing_unsupported_warned", False):
+                logger.warning(
+                    "sequence packing is currently limited to the span architecture; "
+                    "using normal batching for the boundary architecture"
+                )
+                self._packing_unsupported_warned = True
+            self._last_packing_stats = PackingStats(
+                activated=False,
+                reason="unsupported_architecture_boundary",
+                original_count=len(batch),
+                fallback_count=len(batch),
+            )
         core = self._encode_core(batch)
         has_queries = core["query_states"].shape[1] > 0
         candidates = None
