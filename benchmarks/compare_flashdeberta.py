@@ -522,7 +522,7 @@ def parse_args():
     parser.add_argument(
         "--lengths", type=int, nargs="+", default=[64, 128, 256, 512, 1024, 2048]
     )
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 32])
     parser.add_argument("--output", default="benchmarks/flashdeberta_comparison.json")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
