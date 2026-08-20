@@ -6,24 +6,23 @@ Run from the repository root:
     python try_encoder_compile.py
 
 The script loads the checkpoint on CPU, keeps only its Transformers encoder,
-moves that encoder to CUDA, and compares four execution paths:
+moves that encoder to CUDA, and compares three execution paths:
 
 * ``legacy``: ordinary eager PyTorch;
 * ``compiled-default``: the repository's current ``torch.compile`` call; and
-* ``reduce-overhead``: compilation with CUDA graphs where supported;
-* ``max-autotune-buckets``: max autotuning specialized to each supplied shape.
+* ``max-autotune-buckets``: max autotuning on a small set of padded shapes.
 
 For every fixed batch size, each measured run uses a different logical batch.
-That exact batch is shared by all four paths, and the script prints latency plus
+That exact batch is shared by all three paths, and the script prints latency plus
 pairwise max/mean absolute differences without imposing a parity threshold.
 Compilation/warmup uses separately generated batches. At the end, checkpointed
-JSON and tables summarize only paired measurements, including mean tokens/s and
-documents/s within post-hoc groups of close observed lengths and padding.
+JSON and tables summarize only paired measurements. Per-bucket groups report
+valid tokens/s and documents/s; the overall comparison reports valid tokens/s.
 
 The comparison holds batch size fixed while varying exact token dimensions
-between runs. Eager/dynamic paths see the exact BxL tensor; max-autotune sees
-the same tokens padded only along L to the nearest supplied bucket. This models
-batches whose longest sequence changes without inventing random batch sizes.
+between runs. Eager and repository-default compilation see the exact collated
+BxL tensor. Max-autotune sees the same logical tokens padded to the nearest
+configured L bucket. There are no separately measured static-shape cases.
 """
 
 from __future__ import annotations
@@ -62,7 +61,6 @@ EXECUTION_PATHS = (
     # name, torch.compile mode, dynamic
     ("legacy", None, None),
     ("compiled-default", "default", True),
-    ("reduce-overhead", "reduce-overhead", True),
     ("max-autotune-buckets", "max-autotune", False),
 )
 PATH_NAMES = tuple(name for name, _, _ in EXECUTION_PATHS)
@@ -161,9 +159,9 @@ def make_inputs(
         input_ids += (input_ids >= pad_token_id).to(input_ids.dtype)
     attention_mask = torch.ones((batch, length), dtype=torch.long, device=device)
 
-    # L is the longest document in a collated batch. Keep one document at L and
-    # draw the others from a smooth distribution concentrated near it. Padding
-    # is thus an observed workload property, not an artificial test condition.
+    # ``length`` is the longest document in this collated batch. Keep one
+    # document at that length and sample the others near it, producing the
+    # ordinary within-batch padding seen during inference.
     randomizer = random.Random(seed)
     valid_lengths = [length]
     for _ in range(batch - 1):
@@ -178,49 +176,37 @@ def make_inputs(
 
 
 def nearest_length_bucket(actual_length: int, length_buckets: list[int]) -> int:
-    """Return the smallest precompiled token bucket that fits a length."""
+    """Return the smallest configured max-autotune bucket that fits a length."""
     return next(
-        bucket_length
-        for bucket_length in sorted(length_buckets)
-        if actual_length <= bucket_length
+        bucket
+        for bucket in sorted(length_buckets)
+        if actual_length <= bucket
     )
-
-
-def close_length_band(actual_length: int, length_buckets: list[int]) -> str:
-    """Split a routing bucket into two tighter post-hoc comparison bands."""
-    bucket = nearest_length_bucket(actual_length, length_buckets)
-    previous = max(
-        (value for value in length_buckets if value < bucket),
-        default=min(length_buckets) - 1,
-    )
-    lower = previous + 1
-    midpoint = (lower + bucket) // 2
-    if actual_length <= midpoint:
-        return f"{lower}-{midpoint}"
-    return f"{midpoint + 1}-{bucket}"
 
 
 def comparison_schedule(
-    bucket_shapes: list[tuple[int, int]],
+    shape_grid: list[tuple[int, int]],
     runs_per_batch: int,
 ) -> list[dict[str, Any]]:
     """Draw a continuous realistic length workload for every fixed batch size."""
     schedule = []
-    for batch in sorted({batch for batch, _ in bucket_shapes}):
-        length_buckets = sorted({
+    for batch in sorted({batch for batch, _ in shape_grid}):
+        length_boundaries = sorted({
             length
-            for shape_batch, length in bucket_shapes
+            for shape_batch, length in shape_grid
             if shape_batch == batch
         })
-        minimum_length = min(length_buckets)
-        maximum_length = max(length_buckets)
-        median_length = min(max(64, minimum_length), maximum_length)
+        minimum_length = min(length_boundaries)
+        maximum_length = max(length_boundaries)
+        # Center the continuous workload on short 1-2 sentence requests while
+        # retaining a long tail that can naturally reach the 512-token bucket.
+        median_length = min(max(28, minimum_length), maximum_length)
         randomizer = random.Random(91_000 + batch * 1_000)
         seen_lengths = set()
         for run_number in range(1, runs_per_batch + 1):
             for _ in range(100):
                 sampled = round(
-                    randomizer.lognormvariate(math.log(median_length), 0.65)
+                    randomizer.lognormvariate(math.log(median_length), 0.90)
                 )
                 actual_length = max(
                     minimum_length,
@@ -236,11 +222,7 @@ def comparison_schedule(
                 "actual_sequence_length": actual_length,
                 "bucket_sequence_length": nearest_length_bucket(
                     actual_length,
-                    length_buckets,
-                ),
-                "close_length_band": close_length_band(
-                    actual_length,
-                    length_buckets,
+                    length_boundaries,
                 ),
                 "variant": variant,
             })
@@ -256,6 +238,7 @@ def make_actual_and_bucket_inputs(
     device: torch.device,
     variant: int,
 ) -> dict[str, Any]:
+    """Create one logical batch and its max-autotune bucketed representation."""
     actual_ids, actual_mask, valid_lengths = make_inputs(
         batch,
         actual_length,
@@ -264,26 +247,33 @@ def make_actual_and_bucket_inputs(
         device,
         variant=variant,
     )
-    bucket_ids = torch.full(
-        (batch, bucket_length),
-        fill_value=pad_token_id,
-        dtype=actual_ids.dtype,
-        device=device,
-    )
-    bucket_mask = torch.zeros(
-        (batch, bucket_length),
-        dtype=actual_mask.dtype,
-        device=device,
-    )
-    bucket_ids[:, :actual_length] = actual_ids
-    bucket_mask[:, :actual_length] = actual_mask
+    if bucket_length < actual_length:
+        raise ValueError(
+            f"bucket length {bucket_length} is smaller than actual length {actual_length}"
+        )
+    if bucket_length == actual_length:
+        bucket_ids = actual_ids
+        bucket_mask = actual_mask
+    else:
+        bucket_ids = torch.full(
+            (batch, bucket_length),
+            fill_value=pad_token_id,
+            dtype=actual_ids.dtype,
+            device=device,
+        )
+        bucket_mask = torch.zeros(
+            (batch, bucket_length),
+            dtype=actual_mask.dtype,
+            device=device,
+        )
+        bucket_ids[:, :actual_length] = actual_ids
+        bucket_mask[:, :actual_length] = actual_mask
     return {
         "actual_input_ids": actual_ids,
         "actual_attention_mask": actual_mask,
         "bucket_input_ids": bucket_ids,
         "bucket_attention_mask": bucket_mask,
         "valid_lengths": valid_lengths,
-        "bucket_valid_lengths": valid_lengths,
     }
 
 
@@ -300,7 +290,7 @@ def timed_call(encoder, input_ids: torch.Tensor, attention_mask: torch.Tensor) -
 
 
 def configure_recompile_limits(shape_count: int) -> dict[str, Any]:
-    """Allow the static bucket path to retain one specialization per shape."""
+    """Allow compiled paths enough cached specializations for the workload."""
     required = max(8, shape_count + 8)
     settings = {}
     for name in ("recompile_limit", "cache_size_limit", "accumulated_recompile_limit"):
@@ -328,16 +318,15 @@ def configure_recompile_limits(shape_count: int) -> dict[str, Any]:
 def warmup_execution_paths(
     execution_paths,
     schedule: list[dict[str, Any]],
-    bucket_shapes: list[tuple[int, int]],
     embedding_vocab_size: int,
     pad_token_id: int,
     device: torch.device,
     warmup_calls: int,
     max_positions: int,
 ) -> dict[str, Any]:
-    """Compile/warm on batches that are disjoint from measured batches."""
+    """Compile/warm observed exact and routed shapes on disjoint batches."""
     report = {
-        "calls_per_shape": warmup_calls,
+        "calls_per_warmup_batch": warmup_calls,
         "variant_offset": WARMUP_VARIANT_OFFSET,
         "uses_measured_batches": False,
         "paths": {
@@ -350,9 +339,9 @@ def warmup_execution_paths(
         return report
 
     print(
-        "\nPRECOMPILE / WARMUP\n"
-        "  using independent token IDs and document lengths; no measured batch "
-        "is reused",
+        "\nCOMPILE / WARMUP\n"
+        "  independently generated logical batches; exact paths keep actual L "
+        "and max-autotune uses routed bucket L; no measured batch is reused",
         flush=True,
     )
     with torch.inference_mode():
@@ -372,8 +361,8 @@ def warmup_execution_paths(
                 item["variant"] + WARMUP_VARIANT_OFFSET,
             )
             print(
-                f"  warm batch {warm_number}/{len(schedule)}: "
-                f"B={batch} exact_L={actual_length} bucket_L={bucket_length}",
+                f"  warm batch {warm_number}/{len(schedule)}: B={batch} "
+                f"actual_L={actual_length} bucket_L={bucket_length}",
                 flush=True,
             )
             for path_name, path_encoder, _, _, setup_error in execution_paths:
@@ -388,6 +377,7 @@ def warmup_execution_paths(
                     if use_bucket
                     else "actual_attention_mask"
                 ]
+                input_length = bucket_length if use_bucket else actual_length
                 for call_number in range(1, warmup_calls + 1):
                     try:
                         output, elapsed_ms = timed_call(
@@ -408,7 +398,7 @@ def warmup_execution_paths(
                         report["paths"][path_name]["errors"].append({
                             "batch_size": batch,
                             "actual_sequence_length": actual_length,
-                            "bucket_sequence_length": bucket_length,
+                            "input_sequence_length": input_length,
                             "type": type(exc).__name__,
                             "message": str(exc),
                         })
@@ -418,63 +408,7 @@ def warmup_execution_paths(
                             flush=True,
                         )
                         break
-            del inputs
-
-        # Deployment precompiles every configured static bucket, including a
-        # bucket that the finite random measured sample did not happen to draw.
-        observed_buckets = {
-            (item["batch_size"], item["bucket_sequence_length"])
-            for item in schedule
-        }
-        missing_buckets = sorted(set(bucket_shapes) - observed_buckets)
-        bucket_path = next(
-            (entry for entry in execution_paths if entry[0] == "max-autotune-buckets"),
-            None,
-        )
-        if bucket_path is not None:
-            _, path_encoder, _, _, setup_error = bucket_path
-            for index, (batch, bucket_length) in enumerate(missing_buckets, start=1):
-                if setup_error is not None or path_encoder is None:
-                    break
-                if max_positions and bucket_length > max_positions:
-                    continue
-                inputs = make_actual_and_bucket_inputs(
-                    batch,
-                    bucket_length,
-                    bucket_length,
-                    embedding_vocab_size,
-                    pad_token_id,
-                    device,
-                    WARMUP_VARIANT_OFFSET + 100_000_000 + index,
-                )
-                try:
-                    output, elapsed_ms = timed_call(
-                        path_encoder,
-                        inputs["bucket_input_ids"],
-                        inputs["bucket_attention_mask"],
-                    )
-                    del output
-                    row = report["paths"]["max-autotune-buckets"]
-                    row["calls"] += 1
-                    row["total_ms"] += elapsed_ms
-                    print(
-                        f"  static bucket {index}/{len(missing_buckets)}: "
-                        f"B={batch} L={bucket_length} {elapsed_ms:.3f} ms",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    report["paths"]["max-autotune-buckets"]["errors"].append({
-                        "batch_size": batch,
-                        "bucket_sequence_length": bucket_length,
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    })
-                    print(
-                        "  ERROR max-autotune-buckets static precompile: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-                del inputs
+            del input_ids, attention_mask, inputs
     return report
 
 
@@ -590,66 +524,8 @@ def summarize_numerical(
     return comparison_summary
 
 
-def summarize_reduce_vs_buckets(records: list[dict[str, Any]]) -> dict[str, Any]:
-    usable = [
-        record
-        for record in records
-        if record.get("paths", {}).get("reduce-overhead", {}).get("status") == "ok"
-        and record.get("paths", {}).get("max-autotune-buckets", {}).get("status")
-        == "ok"
-    ]
-    speedups = [
-        record["paths"]["reduce-overhead"]["latency"]["median_ms"]
-        / record["paths"]["max-autotune-buckets"]["latency"]["median_ms"]
-        for record in usable
-    ]
-    comparisons = [
-        comparison
-        for record in records
-        for comparison in record.get("numerical_comparisons", [])
-        if comparison["left"] == "max-autotune-buckets"
-        and comparison["right"] == "reduce-overhead"
-        and comparison["status"] == "ok"
-    ]
-    compared_values = sum(row["numel"] for row in comparisons)
-    total_error = sum(row["sum_abs_error"] for row in comparisons)
-    return {
-        "total_steps": len(records),
-        "comparable_steps": len(usable),
-        "unavailable_steps": len(records) - len(usable),
-        "bucket_wins": sum(value > 1.0 for value in speedups),
-        "reduce_overhead_wins": sum(value < 1.0 for value in speedups),
-        "ties": sum(value == 1.0 for value in speedups),
-        "geometric_mean_bucket_speedup_vs_reduce_overhead": geometric_mean(speedups),
-        "median_bucket_speedup_vs_reduce_overhead": (
-            statistics.median(speedups) if speedups else None
-        ),
-        "minimum_bucket_speedup_vs_reduce_overhead": min(speedups) if speedups else None,
-        "maximum_bucket_speedup_vs_reduce_overhead": max(speedups) if speedups else None,
-        "maximum_abs_error_bucket_vs_reduce_overhead": (
-            max(row["max_abs_error"] for row in comparisons)
-            if comparisons
-            else None
-        ),
-        "weighted_mean_abs_error_bucket_vs_reduce_overhead": (
-            total_error / compared_values if compared_values else None
-        ),
-        "compared_values": compared_values,
-    }
-
-
-def observed_padding_band(padding_ratio: float) -> str:
-    if padding_ratio < 0.10:
-        return "<10%"
-    if padding_ratio < 0.20:
-        return "10-20%"
-    if padding_ratio < 0.30:
-        return "20-30%"
-    return ">=30%"
-
-
 def summarize_paired_distribution(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Aggregate only paired runs with close B/L and observed padding."""
+    """Aggregate fully paired random runs by fixed B and routed L bucket."""
     paired = [
         record
         for record in records
@@ -658,23 +534,16 @@ def summarize_paired_distribution(records: list[dict[str, Any]]) -> list[dict[st
             for path_name in PATH_NAMES
         )
     ]
-    grouped: dict[tuple[int, int, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[int, int], list[dict[str, Any]]] = {}
     for record in paired:
         key = (
             record["batch_size"],
             record["bucket_sequence_length"],
-            record["close_length_band"],
-            observed_padding_band(record["actual_padding_ratio"]),
         )
         grouped.setdefault(key, []).append(record)
 
     summaries = []
-    for (
-        batch,
-        length_bucket,
-        length_band,
-        padding_band,
-    ), rows in sorted(grouped.items()):
+    for (batch, length_bucket), rows in sorted(grouped.items()):
         path_rows = {}
         for path_name in PATH_NAMES:
             throughputs = [
@@ -708,9 +577,7 @@ def summarize_paired_distribution(records: list[dict[str, Any]]) -> list[dict[st
         )
         summaries.append({
             "batch_size": batch,
-            "length_bucket": length_bucket,
-            "close_length_band": length_band,
-            "observed_padding_band": padding_band,
+            "bucket_sequence_length": length_bucket,
             "paired_runs": len(rows),
             "minimum_actual_length": min(
                 row["actual_sequence_length"] for row in rows
@@ -736,6 +603,14 @@ def summarize_paired_distribution(records: list[dict[str, Any]]) -> list[dict[st
 def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
     path_summary = {}
     fastest_counts = {name: 0 for name in PATH_NAMES}
+    fully_paired_cases = [
+        case
+        for case in cases
+        if all(
+            case.get("paths", {}).get(path_name, {}).get("status") == "ok"
+            for path_name in PATH_NAMES
+        )
+    ]
     for case in cases:
         completed = [
             (name, result)
@@ -769,21 +644,19 @@ def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             if row.get("speedup_vs_legacy") is not None
         ]
         total_seconds = sum(
-            row["latency"]["median_ms"] * row["iterations"] / 1_000.0
-            for row in rows
-        )
-        total_documents = sum(row["batch_size"] * row["iterations"] for row in rows)
-        total_padded_tokens = sum(
-            row["batch_size"]
-            * row["sequence_length"]
-            * row["iterations"]
-            for row in rows
+            case["paths"][path_name]["latency"]["median_ms"]
+            * case["paths"][path_name]["iterations"]
+            / 1_000.0
+            for case in fully_paired_cases
         )
         total_valid_tokens = sum(
-            row["valid_tokens"] * row["iterations"] for row in rows
+            case["paths"][path_name]["valid_tokens"]
+            * case["paths"][path_name]["iterations"]
+            for case in fully_paired_cases
         )
         path_summary[path_name] = {
             "completed_cases": len(rows),
+            "overall_paired_cases": len(fully_paired_cases),
             "runtime_failures": len(failures),
             "fastest_case_count": fastest_counts[path_name],
             "median_of_case_medians_ms": statistics.median(medians) if medians else None,
@@ -792,12 +665,6 @@ def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "minimum_speedup_vs_legacy": min(speedups) if speedups else None,
             "maximum_speedup_vs_legacy": max(speedups) if speedups else None,
             "wins_vs_legacy": sum(value > 1.0 for value in speedups),
-            "aggregate_documents_per_second": (
-                total_documents / total_seconds if total_seconds else None
-            ),
-            "aggregate_padded_tokens_per_second": (
-                total_padded_tokens / total_seconds if total_seconds else None
-            ),
             "aggregate_valid_tokens_per_second": (
                 total_valid_tokens / total_seconds if total_seconds else None
             ),
@@ -805,9 +672,9 @@ def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         }
 
     return {
-        "total_recorded_shapes": len(cases),
-        "completed_shapes": sum(case.get("status") == "completed" for case in cases),
-        "skipped_shapes": sum(case.get("status") == "skipped" for case in cases),
+        "total_recorded_batches": len(cases),
+        "completed_batches": sum(case.get("status") == "completed" for case in cases),
+        "skipped_batches": sum(case.get("status") == "skipped" for case in cases),
         "input_failures": sum(case.get("status") == "error" for case in cases),
         "runtime_failures": sum(
             result.get("status") == "error"
@@ -817,15 +684,6 @@ def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "paths": path_summary,
         "numerical_comparisons": summarize_numerical(cases),
         "paired_distribution_groups": summarize_paired_distribution(cases),
-        "reduce_overhead_vs_buckets": summarize_reduce_vs_buckets(cases),
-        "reduce_overhead_vs_buckets_by_batch": {
-            str(batch): summarize_reduce_vs_buckets([
-                case for case in cases if case.get("batch_size") == batch
-            ])
-            for batch in sorted({
-                case["batch_size"] for case in cases if "batch_size" in case
-            })
-        },
     }
 
 
@@ -923,20 +781,28 @@ def print_final_tables(cases: list[dict[str, Any]], summary: dict[str, Any]) -> 
         detailed_rows,
     )
 
-    print("\nFINAL PATH SUMMARY", flush=True)
+    print("\nOVERALL VALID-TOKEN THROUGHPUT", flush=True)
     path_rows = []
+    legacy_overall = summary["paths"]["legacy"][
+        "aggregate_valid_tokens_per_second"
+    ]
     for path_name in PATH_NAMES:
         row = summary["paths"][path_name]
+        overall_tok_s = row["aggregate_valid_tokens_per_second"]
+        overall_speedup = (
+            overall_tok_s / legacy_overall
+            if overall_tok_s is not None and legacy_overall
+            else None
+        )
         path_rows.append([
             path_name,
-            str(row["completed_cases"]),
+            str(row["overall_paired_cases"]),
             str(row["runtime_failures"]),
-            str(row["fastest_case_count"]),
-            format_number(row["median_of_case_medians_ms"]),
-            format_number(row["geometric_mean_speedup_vs_legacy"]),
+            format_number(overall_tok_s, 0),
+            format_number(overall_speedup),
         ])
     print_table(
-        ["path", "runs", "errors", "fastest", "median_ms", "geo_x_legacy"],
+        ["path", "runs", "errors", "valid_tok/s", "x_legacy"],
         path_rows,
     )
 
@@ -955,13 +821,11 @@ def print_final_tables(cases: list[dict[str, Any]], summary: dict[str, Any]) -> 
         numerical_rows,
     )
 
-    print("\nPAIRED THROUGHPUT BY OBSERVED LENGTH/PADDING", flush=True)
+    print("\nPAIRED THROUGHPUT BY BATCH SIZE AND LENGTH BUCKET", flush=True)
     distribution_rows = []
     for group in summary["paired_distribution_groups"]:
         group_name = (
-            f"B{group['batch_size']}/L={group['close_length_band']}"
-            f"->bucket{group['length_bucket']}/"
-            f"pad={group['observed_padding_band']}"
+            f"B{group['batch_size']}/bucket{group['bucket_sequence_length']}"
         )
         paths = group["paths"]
         distribution_rows.append([
@@ -979,17 +843,11 @@ def print_final_tables(cases: list[dict[str, Any]], summary: dict[str, Any]) -> 
                 paths["compiled-default"]["mean_valid_tokens_per_second"], 0
             ),
             format_number(
-                paths["reduce-overhead"]["mean_valid_tokens_per_second"], 0
-            ),
-            format_number(
                 paths["max-autotune-buckets"]["mean_valid_tokens_per_second"], 0
             ),
             format_number(paths["legacy"]["mean_documents_per_second"], 1),
             format_number(
                 paths["compiled-default"]["mean_documents_per_second"], 1
-            ),
-            format_number(
-                paths["reduce-overhead"]["mean_documents_per_second"], 1
             ),
             format_number(
                 paths["max-autotune-buckets"]["mean_documents_per_second"], 1
@@ -999,46 +857,11 @@ def print_final_tables(cases: list[dict[str, Any]], summary: dict[str, Any]) -> 
     print_table(
         [
             "group", "n", "actual_L mean[min-max]", "actual_pad", "bucket_pad",
-            "legacy tok/s", "default tok/s", "reduce tok/s", "bucket tok/s",
-            "legacy docs/s", "default docs/s", "reduce docs/s", "bucket docs/s",
+            "legacy tok/s", "default tok/s", "bucket tok/s",
+            "legacy docs/s", "default docs/s", "bucket docs/s",
             "fastest",
         ],
         distribution_rows,
-    )
-
-    print("\nREDUCE-OVERHEAD VS BUCKETED MAX-AUTOTUNE", flush=True)
-    decision_rows = []
-    decision_groups = [
-        ("all", summary["reduce_overhead_vs_buckets"]),
-        *(
-            (f"batch={batch}", row)
-            for batch, row in summary[
-                "reduce_overhead_vs_buckets_by_batch"
-            ].items()
-        ),
-    ]
-    for group, row in decision_groups:
-        decision_rows.append([
-            group,
-            str(row["comparable_steps"]),
-            str(row["unavailable_steps"]),
-            str(row["bucket_wins"]),
-            str(row["reduce_overhead_wins"]),
-            format_number(row["geometric_mean_bucket_speedup_vs_reduce_overhead"]),
-            format_number(row["minimum_bucket_speedup_vs_reduce_overhead"]),
-            format_number(row["maximum_bucket_speedup_vs_reduce_overhead"]),
-            format_number(row["maximum_abs_error_bucket_vs_reduce_overhead"], 7),
-            format_number(
-                row["weighted_mean_abs_error_bucket_vs_reduce_overhead"], 9
-            ),
-        ])
-    print_table(
-        [
-            "group", "paired_runs", "missing", "bucket_wins", "reduce_wins",
-            "geo_bucket_x", "min_bucket_x", "max_bucket_x", "max_abs",
-            "mean_abs",
-        ],
-        decision_rows,
     )
 
 
@@ -1046,7 +869,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            "Compare four eager/compiled GLiNER2 encoder paths across CUDA "
+            "Compare three eager/compiled GLiNER2 encoder paths across CUDA "
             "shapes and save detailed plus aggregate results."
         ),
     )
@@ -1057,8 +880,8 @@ def parse_args() -> argparse.Namespace:
         type=parse_shapes,
         default=list(DEFAULT_SHAPES),
         help=(
-            "comma-separated static BxL buckets; B values define fixed-batch "
-            "series and L values bound/route random measured lengths"
+            "comma-separated BxL routing buckets; B values define fixed-batch "
+            "random streams and L values route max-autotune inputs/reporting"
         ),
     )
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
@@ -1128,11 +951,12 @@ def main() -> int:
     )
     print(
         f"Paths: {', '.join(PATH_NAMES)} | fullgraph={args.fullgraph} | "
-        f"shapes={shape_string(args.shapes)}",
+        f"buckets={shape_string(args.shapes)}",
         flush=True,
     )
     print(
-        "max-autotune-buckets treats every supplied BxL shape as a static bucket.",
+        "Measured workload: random changing lengths only; no separately measured "
+        "static-shape cases. Only max-autotune is bucket padded.",
         flush=True,
     )
     print(
@@ -1196,10 +1020,10 @@ def main() -> int:
             "random_actual_token_lengths": True,
             "runs_per_batch_size": args.runs,
             "mode_order": "rotated_per_measured_batch",
-            "exact_length_paths": [
-                "legacy", "compiled-default", "reduce-overhead"
-            ],
+            "separate_static_measurements": False,
+            "exact_length_paths": ["legacy", "compiled-default"],
             "padded_length_path": "max-autotune-buckets",
+            "grouping": "batch_size_and_routed_length_bucket",
         },
         "input_distribution": {
             "type": "uniform_checkpoint_embedding_rows",
@@ -1207,9 +1031,12 @@ def main() -> int:
             "embedding_rows": embedding_vocab_size,
             "measured_batches_distinct_from_warmup": True,
             "maximum_length_distribution": "truncated_lognormal",
+            "maximum_length_target_median_tokens": 28,
+            "maximum_length_log_sigma": 0.90,
             "within_batch_length_distribution": "scaled_beta",
+            "attention_mask": "realistic_per_example_lengths",
         },
-        "requested_shapes": [
+        "routing_buckets": [
             {"batch_size": batch, "sequence_length": length}
             for batch, length in args.shapes
         ],
@@ -1258,7 +1085,6 @@ def main() -> int:
     metadata["warmup_report"] = warmup_execution_paths(
         execution_paths,
         scheduled_cases,
-        args.shapes,
         embedding_vocab_size,
         pad_token_id,
         device,
@@ -1288,7 +1114,6 @@ def main() -> int:
                 "sequence_length": actual_length,
                 "actual_sequence_length": actual_length,
                 "bucket_sequence_length": bucket_length,
-                "close_length_band": scheduled_case["close_length_band"],
                 "run_number": scheduled_case["run_number"],
                 "status": "running",
                 "paths": {},
@@ -1296,13 +1121,13 @@ def main() -> int:
             }
             if max_positions and bucket_length > max_positions:
                 print(
-                    "  SKIP: bucket length exceeds "
+                    "  SKIP: routed bucket length exceeds "
                     f"max_position_embeddings={max_positions}",
                     flush=True,
                 )
                 case_record["status"] = "skipped"
                 case_record["skip_reason"] = (
-                    "bucket sequence length exceeds "
+                    "routed bucket length exceeds "
                     f"max_position_embeddings={max_positions}"
                 )
                 cases.append(case_record)
@@ -1342,11 +1167,10 @@ def main() -> int:
             case_record["bucket_padding_ratio"] = (
                 1.0 - valid_tokens / (batch * bucket_length)
             )
-            case_record["padding_ratio"] = case_record["actual_padding_ratio"]
             print(
                 f"  exact_input=({batch}, {actual_length}) "
                 f"bucket_input=({batch}, {bucket_length}) "
-                f"mask_valid={valid_lengths}",
+                f"valid_lengths={valid_lengths}",
                 flush=True,
             )
 
@@ -1380,11 +1204,7 @@ def main() -> int:
                     "input_sequence_length": input_length,
                     "actual_sequence_length": actual_length,
                     "bucket_sequence_length": bucket_length,
-                    "bucket": (
-                        {"batch_size": batch, "sequence_length": bucket_length}
-                        if use_bucket
-                        else None
-                    ),
+                    "bucketed": use_bucket,
                 }
                 case_record["paths"][path_name] = path_result
                 if setup_error is not None or path_encoder is None:
@@ -1402,8 +1222,8 @@ def main() -> int:
                     latency = latency_summary([elapsed_ms])
                     if use_bucket:
                         path_output = path_output[:, :actual_length]
-                    # reduce-overhead may return CUDA-graph-managed buffers
-                    # that a later invocation overwrites. Clone immediately.
+                    # max-autotune may use CUDA-graph-managed buffers that a
+                    # later invocation overwrites. Clone immediately.
                     path_output = path_output.detach().clone()
                     outputs[path_name] = path_output
                     del path_output
@@ -1423,7 +1243,7 @@ def main() -> int:
                         "bucket_sequence_length": bucket_length,
                         "valid_tokens": valid_tokens,
                         "documents_per_second": batch * 1_000.0 / path_ms,
-                        "padded_tokens_per_second": (
+                        "tokens_per_second": (
                             batch * input_length * 1_000.0 / path_ms
                         ),
                         "valid_tokens_per_second": valid_tokens * 1_000.0 / path_ms,
@@ -1464,7 +1284,7 @@ def main() -> int:
             case_record["numerical_comparisons"] = compare_outputs(outputs)
 
             del outputs
-            del inputs
+            del input_ids, attention_mask, inputs
             case_record["status"] = "completed"
             cases.append(case_record)
             report = write_report(args.output, metadata, cases, "running")
