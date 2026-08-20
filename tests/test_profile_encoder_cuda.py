@@ -37,6 +37,18 @@ def test_csv_and_percentile_validation():
         MODULE.parse_choice_csv("eager,unknown", ("eager", "compile"))
 
 
+def test_default_sweep_is_the_full_encoder_evaluation():
+    _parser, args = MODULE.parse_args([])
+
+    assert args.batch_sizes == [1, 4, 16]
+    assert args.text_lengths == [32, 128, 320]
+    assert args.schema_sizes == [4, 16, 32]
+    assert args.padding_profiles == ["uniform", "mixed"]
+    assert args.execution_modes == ["eager", "compile"]
+    assert args.warmup == 5
+    assert args.iterations == 20
+
+
 def _row(case_id, mode, length, latency, padding_waste=0.0):
     return {
         "case_id": case_id,

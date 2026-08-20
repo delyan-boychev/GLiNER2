@@ -777,12 +777,12 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     )
     parser.add_argument("--model", default="fastino/gliner2-base-v1")
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
-    parser.add_argument("--batch-sizes", type=parse_positive_csv, default=parse_positive_csv("1,8"))
+    parser.add_argument("--batch-sizes", type=parse_positive_csv, default=parse_positive_csv("1,4,16"))
     parser.add_argument(
         "--text-lengths", type=parse_positive_csv, default=parse_positive_csv("32,128,320"),
         help="comma-separated approximate document word counts",
     )
-    parser.add_argument("--schema-sizes", type=parse_positive_csv, default=parse_positive_csv("4,32"))
+    parser.add_argument("--schema-sizes", type=parse_positive_csv, default=parse_positive_csv("4,16,32"))
     parser.add_argument(
         "--padding-profiles",
         type=lambda value: parse_choice_csv(value, PADDING_FACTORS),
@@ -798,8 +798,8 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         "--compile-static", action="store_true",
         help="compile for static shapes instead of the repository's dynamic=True path",
     )
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--layer-steps", type=int, default=5)
     parser.add_argument("--trace-steps", type=int, default=3)
     parser.add_argument("--trace-case", default="largest", help="case id or 'largest'")
