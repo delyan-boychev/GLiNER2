@@ -41,6 +41,10 @@ from transformers import (
 # boundary architectures share one validated config.
 from gliner2.configuration import ExtractorConfig
 from gliner2.models.base import BaseExtractorModel
+from gliner2.models.encoder_backend import (
+    resolve_encoder_backend,
+    resolve_load_dtype,
+)
 
 
 class SpanExtractorModel(BaseExtractorModel):
@@ -67,10 +71,18 @@ class SpanExtractorModel(BaseExtractorModel):
         """Names of task-specific (non-encoder) submodules for LoRA targeting."""
         return ("span_rep", "classifier", "count_embed", "count_pred")
 
-    def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
+    def __init__(
+        self,
+        config: ExtractorConfig,
+        encoder_config=None,
+        tokenizer=None,
+        encoder_backend: str = "transformers",
+        encoder_backend_reason: Optional[str] = None,
+    ):
         super().__init__(config)
         self.config = config
         self.max_width = config.max_width
+        self._set_encoder_backend(encoder_backend, encoder_backend_reason)
 
         # Initialize processor
         if tokenizer is not None:
@@ -89,6 +101,7 @@ class SpanExtractorModel(BaseExtractorModel):
             config.model_name,
             encoder_config,
             getattr(config, "attn_implementation", "sdpa"),
+            encoder_backend=self.encoder_backend,
         )
 
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
@@ -174,6 +187,7 @@ class SpanExtractorModel(BaseExtractorModel):
                 - count_loss: Count prediction loss
                 - batch_size: Number of valid samples
         """
+        self._guard_flashdeberta_forward()
         if len(batch) == 0:
             return self._empty_loss_dict()
 
@@ -304,6 +318,7 @@ class SpanExtractorModel(BaseExtractorModel):
             - all_token_embs: List of (text_len, hidden) per sample
             - all_schema_embs: List of schema embeddings per sample
         """
+        self._guard_flashdeberta_forward()
         # Forward through encoder
         outputs = self.encoder(
             input_ids=batch.input_ids,
@@ -641,6 +656,11 @@ class SpanExtractorModel(BaseExtractorModel):
         Args:
             repo_or_dir: HuggingFace repo ID or local directory path.
             quantize: If True, convert model to fp16 after loading.
+            dtype: Explicit inference dtype (``torch.float16``/``"fp16"`` or
+                ``torch.bfloat16``/``"bf16"``). ``quantize=True`` remains the
+                FP16 compatibility path.
+            encoder_backend: ``"auto"`` (default), ``"transformers"``, or
+                ``"flashdeberta"``.
             compile: If True, torch.compile the encoder and span-rep
                 with ``dynamic=True`` for fused GPU kernels.
             map_location: Device to load the model onto (e.g. "cpu", "cuda").
@@ -657,6 +677,8 @@ class SpanExtractorModel(BaseExtractorModel):
         from huggingface_hub import hf_hub_download
 
         quantize = kwargs.pop("quantize", False)
+        requested_dtype = kwargs.pop("dtype", None)
+        encoder_backend = kwargs.pop("encoder_backend", "auto")
         compile_model = kwargs.pop("compile", False)
         map_location = kwargs.pop("map_location", None)
         config = kwargs.pop("config", None)
@@ -673,8 +695,22 @@ class SpanExtractorModel(BaseExtractorModel):
         encoder_config_path = download_or_local(repo_or_dir, "encoder_config/config.json")
         encoder_config = AutoConfig.from_pretrained(encoder_config_path)
 
+        effective_dtype = resolve_load_dtype(requested_dtype, quantize=quantize)
+        backend_resolution = resolve_encoder_backend(
+            encoder_backend,
+            encoder_config=encoder_config,
+            map_location=map_location,
+            effective_dtype=effective_dtype,
+        )
+
         tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
-        model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
+        model = cls(
+            config,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            encoder_backend=backend_resolution.backend,
+            encoder_backend_reason=backend_resolution.reason,
+        )
 
         # Load weights
         try:
@@ -697,7 +733,13 @@ class SpanExtractorModel(BaseExtractorModel):
         except KeyError:
             pass
 
-        model.load_state_dict(state_dict)
+        incompatible = model.load_state_dict(state_dict, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "strict checkpoint load failed for the selected encoder backend: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
 
         # Mirror HF PreTrainedModel.from_pretrained semantics so downstream
         # PEFT saves derive ``base_model_name_or_path`` correctly. PEFT reads
@@ -714,6 +756,12 @@ class SpanExtractorModel(BaseExtractorModel):
 
         if quantize:
             model.quantize()
+        elif effective_dtype is not None:
+            model.to(dtype=effective_dtype)
+            logger.info("Converted model to %s", effective_dtype)
+
+        if model.encoder_backend == "flashdeberta":
+            model.eval()
 
         if compile_model:
             model.compile()
@@ -771,12 +819,24 @@ class SpanExtractorModel(BaseExtractorModel):
                                             map_location="cuda")
             model.compile()
         """
-        self.encoder = torch.compile(self.encoder, dynamic=True)
+        compiled = []
+        if self._compile_encoder(dynamic=True):
+            compiled.append("encoder")
         self._compute_span_rep_core = torch.compile(
             self._compute_span_rep_core, dynamic=True,
         )
+        compiled.append("span-rep")
         self.count_embed = torch.compile(self.count_embed, dynamic=True)
-        logger.info("Compiled encoder, span-rep, and count-embed with torch.compile(dynamic=True)")
+        compiled.append("count-embed")
+        logger.info(
+            "Compiled %s with torch.compile(dynamic=True)%s",
+            ", ".join(compiled),
+            (
+                "; FlashDeBERTa encoder left uncompiled because it uses "
+                "handwritten Triton kernels"
+                if self.encoder_backend == "flashdeberta" else ""
+            ),
+        )
         return self
 
     # =========================================================================

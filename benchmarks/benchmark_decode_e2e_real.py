@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """End-to-end real-text benchmark for accelerator decode synchronization.
 
-The default run uses 512 natural-language documents, heterogeneous schemas,
-variable document and encoder lengths, CUDA FP16, and the repository's public
-``compile=True`` loading option.  It compares:
+The default run uses 9 schema profiles (task families), each with 512
+documents. Documents are natural-language units drawn from an expanded
+hand-written corpus and vary in length from a single sentence to a single
+paragraph up to five paragraphs. Within every profile the per-document schema
+is sampled with a seeded RNG, so entity/relation/structure/classification
+queries differ across documents while staying inside a defined band for each
+group. Runs use CUDA FP16 and the repository's public ``compile=True`` loading
+option. It compares:
 
 * ``default``: F.linear scoring and the original per-value synchronized decoder;
 * ``optimized``: the same scoring with synchronization-collapsed decoding.
 
 Every warmup and measured run must produce exactly identical formatted output.
-No synthetic tensors or repeated-token padding are used.
+No synthetic tensors or repeated-token padding are used. Timing is reported
+per profile (per task family), not only aggregated.
 """
 
 from __future__ import annotations
@@ -17,9 +23,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import random
 import statistics
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
@@ -28,6 +35,43 @@ import torch
 from gliner2 import GLiNER2
 from gliner2.inference.schema import AttributeGroup
 from gliner2.training.trainer import ExtractorCollator
+
+
+# Hand-written natural sentences used for the shortest documents.
+SENTENCES = (
+    "Apple's chief executive introduced a new iPhone generation at the company's Cupertino campus.",
+    "Microsoft opened a cloud engineering center in Warsaw after two years of planning with local universities.",
+    "A regional hospital in Manchester expanded its cardiology unit with three new operating rooms.",
+    "NVIDIA presented its latest data-center processors during a developer conference in San Jose.",
+    "The European Central Bank left interest rates unchanged following its meeting in Frankfurt.",
+    "Toyota will add a battery assembly line to its manufacturing plant in Kentucky.",
+    "Researchers at Stanford University published a study of coastal groundwater levels in California.",
+    "Amazon Web Services announced a new cloud region for customers in Thailand.",
+    "A passenger train traveling from Paris to Lyon was delayed after heavy rain damaged signaling equipment.",
+    "The city of Toronto approved funding for two hundred electric buses and charging equipment.",
+    "OpenAI and a group of independent publishers announced a research program on citation discovery.",
+    "A conservation team relocated twelve sea turtles to a protected beach near Cairns.",
+    "Samsung launched a compact foldable phone in Seoul with an upgraded hinge and brighter display.",
+    "The University of Edinburgh created a scholarship fund for students in renewable energy.",
+    "Pfizer began a late-stage clinical study of an experimental influenza vaccine.",
+    "The British Museum placed a collection of restored Roman coins on public display.",
+    "A farming cooperative near Valencia installed solar panels above irrigation canals.",
+    "Netflix acquired worldwide distribution rights to an independent documentary filmed in Iceland.",
+    "SpaceX launched a communications satellite from Cape Canaveral early Tuesday morning.",
+    "A Berlin software company raised twenty-five million euros to expand its fraud-detection platform.",
+    "Japan's national weather agency issued heat warnings for Tokyo, Osaka, and nearby prefectures.",
+    "Ford recalled a group of sport utility vehicles after engineers found a wiring fault.",
+    "Archaeologists working near Alexandria uncovered part of a residential district dating to the second century.",
+    "The World Health Organization delivered emergency medical supplies to clinics affected by flooding.",
+    "A Dutch startup began trials of a delivery drone that can carry packages across urban districts.",
+    "Engineers in Oslo completed a carbon-neutral office tower that heats itself with seawater pumps.",
+    "Chilean astronomers detected a fast radio burst coming from a dwarf galaxy eight billion light-years away.",
+    "The port of Rotterdam tested automated cranes that load containers onto ships without human operators.",
+    "A Swiss watchmaker introduced a limited series of timepieces assembled from recycled aerospace alloys.",
+    "Teachers in Nairobi launched an after-school program teaching students to repair household electronics.",
+    "Brazilian officials announced new rules requiring banks to report cryptocurrency transactions.",
+    "A Canadian film festival awarded its top prize to a documentary about ice-core climate research.",
+)
 
 
 REAL_PARAGRAPHS = (
@@ -55,6 +99,49 @@ REAL_PARAGRAPHS = (
     "Ford recalled a group of sport utility vehicles after engineers identified a fault in the rear camera wiring. Owners will receive letters explaining how dealerships can inspect and replace the affected component without charge.",
     "Archaeologists working near Alexandria uncovered part of a residential district dating to the second century. The excavation revealed painted walls, ceramic workshops, storage rooms, and a street leading toward the ancient harbor.",
     "The World Health Organization delivered emergency medical supplies to clinics affected by flooding in northern Mozambique. The shipment contained antibiotics, water-purification tablets, protective equipment, and treatment kits for severe dehydration.",
+    "A Dutch startup began trials of a delivery drone designed to carry packages across dense urban districts. City authorities granted a temporary license for routes between distribution hubs and neighborhood pickup points.",
+    "Engineers in Oslo completed a carbon-neutral office tower that draws heat from seawater pumps and recycles rainwater for cooling. The building's facade is covered in glass panels that adjust their tint automatically with the sun.",
+    "Chilean astronomers detected a fast radio burst coming from a dwarf galaxy roughly eight billion light-years away. The signal repeats every sixteen days, a pattern the team says is difficult to explain with current models.",
+    "The port of Rotterdam tested automated cranes that load containers onto ships without direct human control. Union leaders asked for guarantees that experienced operators would train the new systems rather than lose their posts.",
+    "A Swiss watchmaker introduced a limited series of timepieces assembled from recycled aerospace alloys. Each model carries a certificate documenting the origin of the metal and the number of units produced.",
+    "Teachers in Nairobi launched an after-school program where students learn to repair household electronics. The initiative recycles donated devices and plans to supply refurbished computers to local schools.",
+    "Brazilian officials announced new rules requiring banks to report cryptocurrency transactions above a fixed threshold. The measure is part of a broader effort to close tax loopholes and monitor cross-border capital flows.",
+    "A Canadian film festival awarded its top prize to a documentary about ice-core research in the Arctic. The jury praised the production for combining archival footage with new measurements collected during a two-year expedition.",
+    "Volkswagen unveiled plans for an entry-level electric hatchback to be built at a plant in eastern Germany. Executives said the model would target a lower price point to compete with imported compact cars in Europe.",
+    "The Australian Securities and Investments Commission fined a trading platform for failing to disclose order-execution costs. Regulators said the penalty reflected repeated violations over a two-year inspection period.",
+    "Researchers at the University of Zurich published a study linking urban tree cover with lower summer temperatures in residential neighborhoods. The analysis used satellite data from more than a thousand cities across six continents.",
+    "A consortium of six European airlines agreed to share real-time weather data through a common platform. The arrangement is designed to reduce fuel burn by allowing pilots to request reroutes around developing storms.",
+    "The state of Kerala announced a five-year plan to install rooftop solar systems on every public school building. Officials estimate the program will cut electricity spending by forty percent while providing backup power.",
+    "A Korean shipbuilder delivered the first of eight methanol-powered container vessels ordered by a shipping line. The company says the engines cut carbon emissions by more than half compared with conventional heavy fuel.",
+    "Linguists at a research institute in Paris completed a digital archive of endangered dialects spoken along the Pyrenees. The collection includes thousands of audio recordings, grammatical notes, and bilingual storybooks.",
+    "A financial watchdog in Singapore proposed guidelines for banks using generative models in credit decisions. The draft rules require institutions to document how models are tested and to allow customers to contest automated denials.",
+    "The city of Copenhagen opened a pedestrian bridge connecting its central station to a redeveloped harbor district. Engineers designed the structure to tilt upward during storms so that rising water levels cannot damage its bearings.",
+    "A nonprofit organization in Lagos distributed solar-powered refrigerators to health clinics without reliable electricity. Health workers said the units allow them to store vaccines and blood products at stable temperatures.",
+    "The European Space Agency selected a mission to study the magnetic field of an unexplored moon of Saturn. The orbiter will measure surface composition and search for plumes of water vapor escaping through cracks in the ice.",
+    "A British pharmacy chain tested a subscription service that delivers prescription refills on a fixed weekly schedule. The company says the program improves adherence for patients managing chronic conditions.",
+    "Researchers in Japan demonstrated a robotic arm that can sort plastic waste by touch, using pressure sensors to recognize material stiffness. The prototype sorts about two hundred items per hour with an accuracy above ninety percent.",
+    "The federal railroad administration opened an investigation after a freight train derailed near a river crossing in Ohio. Investigators are checking the condition of the rails and whether heavy rain had weakened the embankment.",
+    "A technology consortium published a standard for transferring patient records between hospitals and mobile health applications. The group says the new format preserves privacy while making records easier to share in emergencies.",
+    "The government of New Zealand proposed a carbon price floor for agricultural emissions, with a rebate for farmers who adopt low-emission feeding systems. The plan would take effect after two seasons of pilot trials.",
+    "A museum in Vienna unveiled a reconstruction of a medieval trading ship recovered from the Danube. Visitors can walk through the hull and examine replicas of the tools used to build it a thousand years ago.",
+    "An airline in the Middle East ordered forty wide-body aircraft and agreed to purchase sustainable aviation fuel from a producer in Spain. The deal includes an option to expand the order depending on route growth.",
+    "Researchers at a marine laboratory in Australia tagged forty reef sharks to study their movement around tourist diving sites. The data will help park managers decide where to limit boat traffic during breeding season.",
+    "The city council in Montreal approved a pilot program allowing food trucks to operate in parks on a rotating schedule. Vendors must report their waste and energy use so the council can evaluate the environmental impact.",
+    "A semiconductor company in Taiwan began construction of a new research center dedicated to advanced packaging. The facility will employ engineers working on chip designs that stack memory and logic in a single package.",
+    "Physicists at a laboratory near Geneva published results from a detector upgrade that measures the mass of a rare particle with greater precision. The measurement confirms a prediction made thirty years ago by two theorists.",
+    "A cooperative of coffee growers in Guatemala formed an export alliance with a roasting company in the United States. The agreement guarantees minimum prices for the next four harvests in exchange for direct trade.",
+    "The transit authority in Mexico City launched a bike-sharing expansion that adds stations near metro lines and university campuses. Officials say the program aims to reduce congestion during peak commuting hours.",
+    "A team of agronomists in Kenya tested drought-tolerant maize varieties across twelve demonstration farms. Yields improved by a third in the driest plots, and farmers reported that the new seeds required less fertilizer.",
+    "A Norwegian energy company commissioned a floating wind platform designed to operate in deep water far from the coast. The platform will be tested for a year before the company decides whether to scale production.",
+    "The national statistics office published revised figures showing stronger manufacturing growth in the second quarter. Economists said the revision reflected new data on small businesses that earlier surveys had missed.",
+    "A hospital network in Spain deployed software that flags early signs of sepsis from patient monitoring data. Clinicians review the alerts during routine rounds and say the system has reduced response times.",
+    "The Federal Communications Commission proposed a rule requiring internet providers to display broadband speed data on a searchable map. Consumer groups supported the measure, while providers warned about the cost of compliance.",
+    "A publisher in Nigeria began printing low-cost science textbooks in four local languages. The first run of fifty thousand copies will be distributed to secondary schools free of charge.",
+    "Engineers in Denmark finished a trial of wireless charging roads that power electric buses while they drive. The test section recharges vehicles at stops and intersections, and the city plans to expand it to a full route.",
+    "The World Bank approved a loan for a water-recycling project serving two million residents of a coastal city. The investment will upgrade treatment plants and install sensors that detect leaks in the distribution network.",
+    "A research station in Antarctica reported a record low sea-ice extent for the month of August. Scientists say the trend matches projections from climate models that anticipate increasingly open water in the southern winter.",
+    "An e-commerce platform in India launched a same-day delivery network for groceries in three metropolitan areas. The company operates a chain of neighborhood warehouses that stock fast-moving items close to customers.",
+    "The International Olympic Committee selected a host city for the winter games after two rounds of voting. The winning bid emphasized the reuse of existing venues and a compact layout across a single valley.",
 )
 
 
@@ -74,10 +161,55 @@ ENTITY_TYPES = (
     "plant", "food",
 )
 
+CLASSIFICATION_LABELS = (
+    "technology", "business", "health", "science", "public policy", "culture",
+    "transport", "government", "research", "sports", "finance", "energy",
+    "education", "entertainment", "law", "environment",
+)
+
+RELATION_POOL = {
+    "works_for": 0.4,
+    "located_in": 0.4,
+    "announced": 0.4,
+    "acquired": 0.4,
+}
+
+STRUCTURE_FIELDS = (
+    ("organization", "str"),
+    ("subject", "str"),
+    ("location", "list"),
+    ("date", "str"),
+    ("amount", "list"),
+    ("status", "str", ("planned", "ongoing", "completed", "cancelled")),
+    ("actor", "str"),
+    ("action", "str"),
+    ("place", "list"),
+    ("time", "str"),
+    ("reason", "str"),
+    ("outcome", "list"),
+    ("participants", "list"),
+    ("budget", "str"),
+)
+
+ATTRIBUTE_GROUPS = {
+    "role": ("executive", "researcher", "official", "participant", "spokesperson"),
+    "prominence": ("primary", "secondary"),
+    "sentiment": ("positive", "negative", "neutral"),
+    "scale": ("local", "regional", "national", "global"),
+}
+
 
 VARIANTS = {
     "default": False,
     "optimized": True,
+}
+
+# Entity query-count bands per entities_qN profile (min, max inclusive).
+ENTITY_BANDS = {
+    "entities_q4": (3, 5),
+    "entities_q16": (12, 20),
+    "entities_q32": (26, 38),
+    "entities_q64": (56, 64),
 }
 
 
@@ -120,102 +252,157 @@ def load_corpus(path: Path) -> List[str]:
     return documents
 
 
-def build_documents(count: int, corpus: Sequence[str]) -> List[str]:
-    """Build varied documents from whole natural-language paragraphs."""
+def build_documents(
+    count: int,
+    paragraphs: Sequence[str],
+    sentences: Sequence[str],
+    seed: int,
+    sentence_fraction: float = 0.2,
+    single_paragraph_fraction: float = 0.2,
+) -> List[str]:
+    """Build realistic documents of varied length.
+
+    About ``sentence_fraction`` of documents are a single sentence, about
+    ``single_paragraph_fraction`` are one paragraph, and the remainder are two
+    to five paragraphs joined with blank lines. A per-call RNG seeded with
+    ``seed`` makes the corpus reproducible while giving each profile a distinct
+    set of documents.
+    """
+    rng = random.Random(seed)
     documents = []
-    paragraph_counts = (1, 2, 1, 3, 2, 4, 1, 5)
     for index in range(count):
-        paragraph_count = paragraph_counts[index % len(paragraph_counts)]
-        start = (index * 5 + index // len(paragraph_counts)) % len(corpus)
-        paragraphs = [
-            corpus[(start + offset) % len(corpus)]
-            for offset in range(paragraph_count)
-        ]
-        documents.append("\n\n".join(paragraphs))
+        roll = rng.random()
+        if roll < sentence_fraction:
+            documents.append(sentences[index % len(sentences)])
+        elif roll < sentence_fraction + single_paragraph_fraction:
+            documents.append(paragraphs[index % len(paragraphs)])
+        else:
+            paragraph_count = rng.randint(2, 5)
+            start = rng.randrange(len(paragraphs))
+            documents.append("\n\n".join(
+                paragraphs[(start + offset) % len(paragraphs)]
+                for offset in range(paragraph_count)
+            ))
     return documents
 
 
-def build_schema_profiles(model) -> List[Tuple[str, Any]]:
-    entity_4 = model.create_schema().entities(list(ENTITY_TYPES[:4]))
-    entity_16 = model.create_schema().entities(list(ENTITY_TYPES[:16]))
-    entity_32 = model.create_schema().entities(list(ENTITY_TYPES[:32]))
-    entity_64 = model.create_schema().entities(list(ENTITY_TYPES[:64]))
+# ─── Per-document schema builders ─────────────────────────────────────────
 
-    classifications = (
-        model.create_schema()
-        .classification(
-            "topic",
-            ["technology", "business", "health", "science", "public policy", "culture"],
+def _entities_builder(model, band: Tuple[int, int]):
+    low, high = band
+
+    def builder(rng: random.Random) -> Any:
+        count = rng.randint(low, high)
+        types = rng.sample(list(ENTITY_TYPES), min(count, len(ENTITY_TYPES)))
+        return model.create_schema().entities(types)
+
+    return builder
+
+
+def _classifications_builder(model):
+    def builder(rng: random.Random) -> Any:
+        schema = model.create_schema()
+        task_count = rng.randint(1, 2)
+        for index in range(task_count):
+            labels = rng.sample(
+                list(CLASSIFICATION_LABELS),
+                rng.randint(2, min(6, len(CLASSIFICATION_LABELS))),
+            )
+            if rng.random() < 0.5:
+                schema.classification(
+                    f"task{index + 1}", labels, multi_label=True, cls_threshold=0.35
+                )
+            else:
+                schema.classification(f"task{index + 1}", labels)
+        return schema
+
+    return builder
+
+
+def _relations_builder(model):
+    def builder(rng: random.Random) -> Any:
+        names = rng.sample(list(RELATION_POOL), rng.randint(1, len(RELATION_POOL)))
+        return model.create_schema().relations(
+            {name: {"threshold": RELATION_POOL[name]} for name in names}
         )
-        .classification(
-            "signals",
-            ["announcement", "financial event", "research finding", "public warning"],
-            multi_label=True,
-            cls_threshold=0.35,
-        )
-    )
-    relations = model.create_schema().relations(
-        {
-            "works_for": {"threshold": 0.4},
-            "located_in": {"threshold": 0.4},
-            "announced": {"threshold": 0.4},
-            "acquired": {"threshold": 0.4},
-        }
-    )
-    structures = (
-        model.create_schema()
-        .structure("announcement")
-        .field("organization", dtype="str")
-        .field("subject", dtype="str")
-        .field("location", dtype="list")
-        .field("date", dtype="str")
-        .field("amount", dtype="list")
-        .field(
-            "status", dtype="str",
-            choices=["planned", "ongoing", "completed", "cancelled"],
-        )
-    )
-    mixed = (
-        model.create_schema()
-        .entities(list(ENTITY_TYPES[:12]))
-        .classification(
-            "document type",
-            ["company news", "research", "health", "transport", "government"],
-        )
-        .relations(["works_for", "located_in", "announced"], threshold=0.4)
-        .structure("event summary")
-        .field("actor", dtype="str")
-        .field("action", dtype="str")
-        .field("place", dtype="list")
-        .field("time", dtype="str")
-    )
-    attributes = (
-        model.create_schema()
-        .entities(["person", "organization", "product"])
-        .entity_attributes({
-            "role": AttributeGroup(
-                ["executive", "researcher", "official", "participant"],
-                qualify_labels=True,
-            ),
-            "prominence": AttributeGroup(
-                ["primary", "secondary"],
-                multi_label=True,
+
+    return builder
+
+
+def _structures_builder(model):
+    def builder(rng: random.Random) -> Any:
+        schema = model.create_schema().structure("announcement")
+        fields = rng.sample(list(STRUCTURE_FIELDS), rng.randint(2, 6))
+        for field in fields:
+            if len(field) == 3:
+                schema.field(field[0], dtype=field[1], choices=list(field[2]))
+            else:
+                schema.field(field[0], dtype=field[1])
+        return schema
+
+    return builder
+
+
+def _mixed_builder(model):
+    def builder(rng: random.Random) -> Any:
+        schema = model.create_schema()
+        schema.entities(rng.sample(list(ENTITY_TYPES), rng.randint(4, 16)))
+        if rng.random() < 0.7:
+            labels = rng.sample(
+                list(CLASSIFICATION_LABELS),
+                rng.randint(2, min(5, len(CLASSIFICATION_LABELS))),
+            )
+            schema.classification("document type", labels)
+        if rng.random() < 0.7:
+            names = rng.sample(list(RELATION_POOL), rng.randint(1, 3))
+            schema.relations(
+                {name: {"threshold": RELATION_POOL[name]} for name in names}
+            )
+        if rng.random() < 0.7:
+            structure = schema.structure("event summary")
+            fields = rng.sample(list(STRUCTURE_FIELDS), rng.randint(2, 5))
+            for field in fields:
+                if len(field) == 3:
+                    structure.field(field[0], dtype=field[1], choices=list(field[2]))
+                else:
+                    structure.field(field[0], dtype=field[1])
+        return schema
+
+    return builder
+
+
+def _attributes_builder(model):
+    def builder(rng: random.Random) -> Any:
+        schema = model.create_schema().entities(["person", "organization", "product"])
+        group_names = rng.sample(list(ATTRIBUTE_GROUPS), rng.randint(1, 2))
+        attributes = {}
+        for name in group_names:
+            labels = rng.sample(
+                list(ATTRIBUTE_GROUPS[name]),
+                rng.randint(2, len(ATTRIBUTE_GROUPS[name])),
+            )
+            attributes[name] = AttributeGroup(
+                labels,
+                qualify_labels=rng.random() < 0.5,
+                multi_label=rng.random() < 0.3,
                 threshold=0.35,
-                qualify_labels=True,
-            ),
-        })
-    )
-    return [
-        ("entities_q4", entity_4),
-        ("entities_q16", entity_16),
-        ("entities_q32", entity_32),
-        ("entities_q64", entity_64),
-        ("classifications", classifications),
-        ("relations", relations),
-        ("structures", structures),
-        ("mixed", mixed),
-        ("entity_attributes", attributes),
-    ]
+            )
+        return schema.entity_attributes(attributes)
+
+    return builder
+
+
+def build_schema_profiles(model) -> List[Tuple[str, Callable[[random.Random], Any]]]:
+    """Return ``(name, builder)`` pairs; each builder yields a per-document schema."""
+    profiles: List[Tuple[str, Callable[[random.Random], Any]]] = []
+    for name, band in ENTITY_BANDS.items():
+        profiles.append((name, _entities_builder(model, band)))
+    profiles.append(("classifications", _classifications_builder(model)))
+    profiles.append(("relations", _relations_builder(model)))
+    profiles.append(("structures", _structures_builder(model)))
+    profiles.append(("mixed", _mixed_builder(model)))
+    profiles.append(("entity_attributes", _attributes_builder(model)))
+    return profiles
 
 
 def digest(value: Any) -> str:
@@ -297,12 +484,15 @@ def main() -> int:
     )
     parser.add_argument("--model", default="fastino/gliner2-base-v1")
     parser.add_argument("--device", choices=("cuda", "mps", "cpu"), default="cuda")
-    parser.add_argument("--documents", type=int, default=512)
+    parser.add_argument("--documents", type=int, default=512,
+                        help="documents per schema profile")
     parser.add_argument("--batch-sizes", type=parse_int_list, default=parse_int_list("8,16,32"))
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--execution-mode", choices=("compile", "eager"), default="compile")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="deterministic seed for document and schema sampling")
     parser.add_argument(
         "--corpus", type=Path,
         help="optional JSONL with a text field, or plain text with one document per line",
@@ -332,43 +522,61 @@ def main() -> int:
         compile=compile_model,
     ).eval()
 
-    corpus = load_corpus(args.corpus) if args.corpus else list(REAL_PARAGRAPHS)
-    texts = build_documents(args.documents, corpus)
+    paragraphs = load_corpus(args.corpus) if args.corpus else list(REAL_PARAGRAPHS)
+    sentences = list(SENTENCES)
     profiles = build_schema_profiles(model)
-    profile_names = [profiles[index % len(profiles)][0] for index in range(len(texts))]
-    schemas = [profiles[index % len(profiles)][1] for index in range(len(texts))]
-    profile_counts = dict(Counter(profile_names))
+    print(f"schema profiles: {len(profiles)} x {args.documents} documents each")
 
-    tokenizer_output = model.processor.tokenizer(
-        texts, add_special_tokens=False, truncation=False
-    )
-    document_token_lengths = [len(ids) for ids in tokenizer_output["input_ids"]]
+    # Build a distinct, reproducible 512-document corpus per profile.
+    groups: "OrderedDict[str, Tuple[List[str], List[Any]]]" = OrderedDict()
+    for index, (name, builder) in enumerate(profiles):
+        group_seed = args.seed + index * 1_000_003
+        texts = build_documents(
+            args.documents, paragraphs, sentences, seed=group_seed
+        )
+        rng = random.Random(group_seed + 7)
+        schemas = [builder(rng) for _ in range(args.documents)]
+        groups[name] = (texts, schemas)
 
-    schema_dicts, _ = model._build_schema_dicts_and_metadata(schemas)
+    tokenizer = model.processor.tokenizer
     collator = ExtractorCollator(
         model.processor, is_training=False, architecture=model.architecture
     )
-    encoder_lengths = []
     inspection_batch_size = max(args.batch_sizes)
-    for offset in range(0, len(texts), inspection_batch_size):
-        batch = collator(list(zip(
-            texts[offset:offset + inspection_batch_size],
-            schema_dicts[offset:offset + inspection_batch_size],
-        )))
-        encoder_lengths.extend(batch.attention_mask.sum(dim=1).tolist())
+    length_summaries: "OrderedDict[str, Dict[str, Dict[str, float]]]" = OrderedDict()
+    for name, (texts, schemas) in groups.items():
+        tokenizer_output = tokenizer(texts, add_special_tokens=False, truncation=False)
+        document_token_lengths = [len(ids) for ids in tokenizer_output["input_ids"]]
+        schema_dicts, _ = model._build_schema_dicts_and_metadata(schemas)
+        encoder_lengths = []
+        for offset in range(0, len(texts), inspection_batch_size):
+            batch = collator(list(zip(
+                texts[offset:offset + inspection_batch_size],
+                schema_dicts[offset:offset + inspection_batch_size],
+            )))
+            encoder_lengths.extend(batch.attention_mask.sum(dim=1).tolist())
+        length_summaries[name] = {
+            "document_token_lengths": length_summary(document_token_lengths),
+            "encoder_sequence_lengths": length_summary(encoder_lengths),
+        }
+        print(
+            f"  {name:<16} tokens={length_summaries[name]['document_token_lengths']['mean']:.0f}"
+            f" mean | enc={length_summaries[name]['encoder_sequence_lengths']['max']:.0f} max"
+        )
 
-    print("schema profiles:", profile_counts)
-    print("document token lengths:", length_summary(document_token_lengths))
-    print("encoder sequence lengths:", length_summary(encoder_lengths))
+    def configure(variant: str) -> None:
+        model.sync_collapsed_decode = VARIANTS[variant]
 
-    def configure(name: str) -> None:
-        model.sync_collapsed_decode = VARIANTS[name]
-
-    def run(name: str, batch_size: int, run_texts=texts, run_schemas=schemas):
-        configure(name)
+    def run(
+        variant: str,
+        batch_size: int,
+        texts: Sequence[str],
+        schemas: Sequence[Any],
+    ) -> List[Dict]:
+        configure(variant)
         return model.batch_extract(
-            run_texts,
-            run_schemas,
+            texts,
+            schemas,
             batch_size=batch_size,
             threshold=args.threshold,
             num_workers=0,
@@ -377,82 +585,86 @@ def main() -> int:
             include_spans=True,
         )
 
-    benchmark_results = {}
+    benchmark_results: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
     with torch.inference_mode():
         for batch_size in args.batch_sizes:
             print(f"\nbenchmarking batch_size={batch_size}")
-            warm_count = min(len(texts), max(72, batch_size * 4))
-            warm_texts = texts[:warm_count]
-            warm_schemas = schemas[:warm_count]
+            batch_results: "OrderedDict[str, Any]" = OrderedDict()
+            for name, (texts, schemas) in groups.items():
+                warm_count = min(len(texts), max(72, batch_size * 4))
+                warm_texts = texts[:warm_count]
+                warm_schemas = schemas[:warm_count]
 
-            def run_warm(name: str):
-                configure(name)
-                return model.batch_extract(
-                    warm_texts,
-                    warm_schemas,
-                    batch_size=batch_size,
-                    threshold=args.threshold,
-                    num_workers=0,
-                    format_results=True,
-                    include_confidence=True,
-                    include_spans=True,
-                )
-
-            for warmup_index in range(args.warmup):
-                warm_outputs = {name: run_warm(name) for name in VARIANTS}
-                assert_exact(
-                    warm_outputs["default"], warm_outputs["optimized"],
-                    f"batch={batch_size} warmup={warmup_index}",
-                )
-
-            samples = {name: [] for name in VARIANTS}
-            reference_digest = None
-            names = list(VARIANTS)
-            for iteration in range(args.iterations):
-                order = names[iteration % len(names):] + names[:iteration % len(names)]
-                outputs = {}
-                for name in order:
-                    outputs[name], timing = measure(
-                        lambda name=name: run(name, batch_size), device
-                    )
-                    samples[name].append(timing)
-                assert_exact(
-                    outputs["default"], outputs["optimized"],
-                    f"batch={batch_size} iteration={iteration}",
-                )
-                current_digest = digest(outputs["default"])
-                if reference_digest is None:
-                    reference_digest = current_digest
-                elif current_digest != reference_digest:
-                    raise AssertionError(
-                        f"default output changed across iterations for batch {batch_size}"
+                for warmup_index in range(args.warmup):
+                    warm_outputs = {
+                        variant: run(variant, batch_size, warm_texts, warm_schemas)
+                        for variant in VARIANTS
+                    }
+                    assert_exact(
+                        warm_outputs["default"], warm_outputs["optimized"],
+                        f"batch={batch_size} profile={name} warmup={warmup_index}",
                     )
 
-            summary = {
-                name: summarize(values, len(texts))
-                for name, values in samples.items()
-            }
-            summary["speedup"] = (
-                summary["default"]["median_ms"]
-                / summary["optimized"]["median_ms"]
-            )
-            summary["formatted_parity"] = "exact"
-            summary["output_sha256"] = reference_digest
-            benchmark_results[str(batch_size)] = summary
+                samples: Dict[str, List[Dict[str, float]]] = {
+                    variant: [] for variant in VARIANTS
+                }
+                reference_digest = None
+                variants = list(VARIANTS)
+                for iteration in range(args.iterations):
+                    order = (
+                        variants[iteration % len(variants):]
+                        + variants[:iteration % len(variants)]
+                    )
+                    outputs: Dict[str, List[Dict]] = {}
+                    for variant in order:
+                        outputs[variant], timing = measure(
+                            lambda variant=variant: run(
+                                variant, batch_size, texts, schemas
+                            ),
+                            device,
+                        )
+                        samples[variant].append(timing)
+                    assert_exact(
+                        outputs["default"], outputs["optimized"],
+                        f"batch={batch_size} profile={name} iteration={iteration}",
+                    )
+                    current_digest = digest(outputs["default"])
+                    if reference_digest is None:
+                        reference_digest = current_digest
+                    elif current_digest != reference_digest:
+                        raise AssertionError(
+                            f"default output changed across iterations for "
+                            f"batch {batch_size} profile {name}"
+                        )
 
-            for name in VARIANTS:
-                row = summary[name]
-                memory = (
-                    f" peak={row['peak_allocated_mib']:.1f}MiB"
-                    if "peak_allocated_mib" in row else ""
+                summary = {
+                    variant: summarize(values, len(texts))
+                    for variant, values in samples.items()
+                }
+                summary["speedup"] = (
+                    summary["default"]["median_ms"]
+                    / summary["optimized"]["median_ms"]
                 )
-                print(
-                    f"{name:<12} median={row['median_ms']:.2f}ms "
-                    f"p90={row['p90_ms']:.2f}ms "
-                    f"docs/s={row['documents_per_second']:.2f}{memory}"
-                )
-            print(f"speedup: {summary['speedup']:.3f}x")
-            print(f"formatted parity: exact ({reference_digest})")
+                summary["formatted_parity"] = "exact"
+                summary["output_sha256"] = reference_digest
+                batch_results[name] = summary
+
+                for variant in VARIANTS:
+                    row = summary[variant]
+                    memory = (
+                        f" peak={row['peak_allocated_mib']:.1f}MiB"
+                        if "peak_allocated_mib" in row else ""
+                    )
+                    print(
+                        f"  {name:<16} {variant:<10} "
+                        f"median={row['median_ms']:.2f}ms "
+                        f"p90={row['p90_ms']:.2f}ms "
+                        f"docs/s={row['documents_per_second']:.2f}{memory}"
+                    )
+                print(f"  {name:<16} speedup: {summary['speedup']:.3f}x")
+                print(f"  {name:<16} formatted parity: exact ({reference_digest})")
+
+            benchmark_results[str(batch_size)] = batch_results
 
     result = {
         "model": args.model,
@@ -462,15 +674,11 @@ def main() -> int:
         ),
         "dtype": "fp16",
         "execution_mode": args.execution_mode,
-        "documents": len(texts),
-        "batch_sizes": args.batch_sizes,
-        "warmup": args.warmup,
-        "iterations": args.iterations,
-        "threshold": args.threshold,
-        "schema_profiles": profile_counts,
-        "document_token_lengths": length_summary(document_token_lengths),
-        "encoder_sequence_lengths": length_summary(encoder_lengths),
-        "results": benchmark_results,
+        "seed": args.seed,
+        "documents_per_profile": args.documents,
+        "schema_profiles": {name: len(texts) for name, (texts, _) in groups.items()},
+        "length_summaries": dict(length_summaries),
+        "results": dict(benchmark_results),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2))

@@ -43,6 +43,9 @@ local = [
     "transformers",
     "peft",
 ]
+flash = [
+    "flashdeberta==0.0.7",
+]
 
 [tool.pytest.ini_options]
 markers = [

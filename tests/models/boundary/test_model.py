@@ -58,6 +58,8 @@ def test_boundary_save_reload_preserves_architecture_and_weights(tmp_path):
 
     reloaded = AutoExtractor.from_pretrained(str(save_dir))
     assert reloaded.architecture == "boundary"
+    assert reloaded.encoder_backend == "transformers"
+    assert "automatic FlashDeBERTa selection skipped" in reloaded.encoder_backend_reason
 
     a = dict(model.state_dict())
     b = dict(reloaded.state_dict())
@@ -82,3 +84,22 @@ def test_boundary_public_entity_inference_uses_standard_span_keys():
             assert {"text", "start", "end"} <= set(item)
             assert "char_start" not in item and "char_end" not in item
             assert item["text"] == "Apple released iPhone."[item["start"] : item["end"]]
+
+
+def test_boundary_compile_skips_flash_encoder_but_compiles_heads(monkeypatch):
+    model = build_tiny_boundary_model()
+    model.encoder_backend = "flashdeberta"
+    original_encoder = model.encoder
+    compiled = []
+
+    def fake_compile(module, *, dynamic):
+        compiled.append((module, dynamic))
+        return module
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model.compile(dynamic=True)
+
+    assert model.encoder is original_encoder
+    assert all(module is not original_encoder for module, _ in compiled)
+    assert len(compiled) >= 4
+    assert all(dynamic is True for _, dynamic in compiled)

@@ -14,6 +14,8 @@ def test_old_span_save_reload_matches(tmp_path):
 
     model.save_pretrained(str(tmp_path))
     reloaded = GLiNER2.from_pretrained(str(tmp_path))
+    assert reloaded.encoder_backend == "transformers"
+    assert "automatic FlashDeBERTa selection skipped" in reloaded.encoder_backend_reason
     after = compute_span_signature(reloaded)
 
     assert before["state_keys"] == after["state_keys"]
@@ -35,3 +37,14 @@ def test_saved_state_dict_keys_are_unchanged(tmp_path):
     reloaded = GLiNER2.from_pretrained(str(tmp_path))
     keys_after = sorted(reloaded.state_dict().keys())
     assert keys_before == keys_after
+
+
+@torch.no_grad()
+def test_explicit_bf16_load_dtype_uses_transformers_on_cpu(tmp_path):
+    from gliner2 import GLiNER2
+
+    build_tiny_span_model().save_pretrained(str(tmp_path))
+    reloaded = GLiNER2.from_pretrained(str(tmp_path), dtype="bf16")
+
+    assert reloaded.encoder_backend == "transformers"
+    assert next(reloaded.parameters()).dtype is torch.bfloat16
