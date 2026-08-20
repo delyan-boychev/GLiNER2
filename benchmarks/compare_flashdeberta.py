@@ -116,7 +116,7 @@ def heterogeneous_texts(tokenizer, length: int, batch_size: int) -> List[str]:
     # Alternating lengths produce high and low padding ratios in the same sweep.
     ratios = (1.0, 0.25, 0.70, 0.12, 0.45, 0.90, 0.33, 0.60)
     return [
-        make_text(tokenizer, max(16, int(length * ratios[i])), salt=i % 5)
+        make_text(tokenizer, max(16, int(length * ratios[i % len(ratios)])), salt=i % 5)
         for i in range(batch_size)
     ]
 
@@ -240,7 +240,13 @@ def torch_device():
 
 
 def measure_condition(
-    model, texts: List[str], schema, warmup: int, measure: int
+    model,
+    texts: List[str],
+    schema,
+    warmup: int,
+    measure: int,
+    *,
+    prefix: str,
 ) -> Dict[str, Any]:
     import torch
 
@@ -272,15 +278,25 @@ def measure_condition(
 
     tokens = sum(len(model.processor.tokenizer.encode(text)) for text in texts)
     median = statistics.median(e2e_times)
-    return {
+    result = {
         "encoder": summarize(encoder_times),
         "e2e": summarize(e2e_times),
         "documents_per_second": len(texts) / median,
         "tokens_per_second": tokens / median,
         "peak_allocated_mb": torch.cuda.max_memory_allocated() / 2**20,
         "peak_reserved_mb": torch.cuda.max_memory_reserved() / 2**20,
+        "encoder_samples_seconds": encoder_times,
         "e2e_samples_seconds": e2e_times,
     }
+    print(
+        f"[{prefix}] enc median={result['encoder']['median_ms']:.2f} ms | "
+        f"e2e median={result['e2e']['median_ms']:.2f} ms "
+        f"p90={result['e2e']['p90_ms']:.2f} ms p95={result['e2e']['p95_ms']:.2f} ms | "
+        f"{result['documents_per_second']:.2f} docs/s | "
+        f"peak={result['peak_allocated_mb']:.1f} MiB",
+        flush=True,
+    )
+    return result
 
 
 def consistency_checks(model, tokenizer, schema) -> List[str]:
@@ -312,6 +328,12 @@ def worker(args) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("FlashDeBERTa comparison requires CUDA")
     dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+    worker_prefix = f"{args.backend}/{args.dtype}"
+    print(
+        f"[{worker_prefix}] loading {args.model} on CUDA "
+        f"(compile={args.compile})",
+        flush=True,
+    )
     model = GLiNER2.from_pretrained(
         args.model,
         map_location="cuda",
@@ -320,6 +342,12 @@ def worker(args) -> None:
         compile=args.compile,
     )
     model.eval()
+    print(
+        f"[{worker_prefix}] loaded backend={model.encoder_backend}; "
+        f"GPU={torch.cuda.get_device_name()}; "
+        f"reason={model.encoder_backend_reason}",
+        flush=True,
+    )
     schemas = build_schemas(model)
     tokenizer = model.processor.tokenizer
 
@@ -349,9 +377,15 @@ def worker(args) -> None:
                 texts = heterogeneous_texts(tokenizer, length, batch_size)
                 key = f"{name}_l{length}_b{batch_size}"
                 conditions[key] = measure_condition(
-                    model, texts, schemas[name], args.warmup, args.measure
+                    model,
+                    texts,
+                    schemas[name],
+                    args.warmup,
+                    args.measure,
+                    prefix=f"{worker_prefix} {key}",
                 )
 
+    consistency_issues = consistency_checks(model, tokenizer, schemas["mixed"])
     payload = {
         "backend": model.encoder_backend,
         "backend_reason": model.encoder_backend_reason,
@@ -360,7 +394,7 @@ def worker(args) -> None:
         "gpu": torch.cuda.get_device_name(),
         "capability": torch.cuda.get_device_capability(),
         "conditions": conditions,
-        "consistency_issues": consistency_checks(model, tokenizer, schemas["mixed"]),
+        "consistency_issues": consistency_issues,
         "snapshots": snapshots,
     }
     torch.save(payload, args.artifact)
@@ -485,8 +519,10 @@ def parse_args():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--measure", type=int, default=20)
-    parser.add_argument("--lengths", type=int, nargs="+", default=[64, 256, 512])
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4])
+    parser.add_argument(
+        "--lengths", type=int, nargs="+", default=[64, 128, 256, 512, 1024, 2048]
+    )
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16])
     parser.add_argument("--output", default="benchmarks/flashdeberta_comparison.json")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -494,6 +530,25 @@ def parse_args():
     )
     parser.add_argument("--artifact", help=argparse.SUPPRESS)
     return parser.parse_args()
+
+
+def print_speedup_tables(reports: Dict[str, Any]) -> None:
+    """Print per-dtype, per-schema batch x doc-length median-speedup matrices."""
+    for dtype, report in reports.items():
+        rows = report["conditions"]
+        lengths = sorted({int(key.split("_l")[1].split("_b")[0]) for key in rows})
+        batches = sorted({int(key.split("_b")[1]) for key in rows})
+        schemas = sorted({key.split("_l")[0] for key in rows})
+        print(f"\n=== {dtype}: median speedup (standard / flashdeberta, >1x is faster) ===")
+        for schema in schemas:
+            print(f"\n  {schema}")
+            print(f"  {'bs\\len':<8}" + "".join(f"{length:>8}" for length in lengths))
+            for batch in batches:
+                cells = []
+                for length in lengths:
+                    speedup = rows[f"{schema}_l{length}_b{batch}"]["median_speedup"]
+                    cells.append(f"{speedup:>7.2f}x")
+                print(f"  {batch:<8}" + "".join(cells))
 
 
 def main() -> None:
@@ -515,6 +570,8 @@ def main() -> None:
             standard = torch.load(standard_path, map_location="cpu", weights_only=True)
             flash = torch.load(flash_path, map_location="cpu", weights_only=True)
             reports[dtype] = acceptance_report(standard, flash, dtype)
+
+    print_speedup_tables(reports)
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
