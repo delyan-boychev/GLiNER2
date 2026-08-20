@@ -9,8 +9,9 @@ own encode path until parity is proven (per the blueprint).
 
 from __future__ import annotations
 
-import importlib.metadata
+import importlib.util
 import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -120,7 +121,6 @@ class BaseExtractorModel(PreTrainedModel):
         model_name: str,
         encoder_config: Optional[PretrainedConfig] = None,
         attn_implementation: Optional[str] = "sdpa",
-        encoder_backend: str = "transformers",
     ) -> nn.Module:
         """Load a shared optimized encoder with a safe eager fallback."""
         config = encoder_config
@@ -129,13 +129,16 @@ class BaseExtractorModel(PreTrainedModel):
                 model_name, trust_remote_code=True
             )
 
-        if encoder_backend == "flashdeberta":
-            from gliner2.models.flashdeberta import build_flashdeberta_encoder
+        use_flashdeberta = bool(os.environ.get("USE_FLASHDEBERTA")) and (
+            importlib.util.find_spec("flashdeberta") is not None
+        )
+        if config.__class__.__name__ == "DebertaV2Config" and use_flashdeberta:
+            from flashdeberta import FlashDebertaV2Model
 
-            version = importlib.metadata.version("flashdeberta")
-            return build_flashdeberta_encoder(config, version)
-        if encoder_backend != "transformers":
-            raise ValueError(f"unresolved encoder backend {encoder_backend!r}")
+            logger.info("Using FlashDeberta backend")
+            if encoder_config is not None:
+                return FlashDebertaV2Model(config)
+            return FlashDebertaV2Model.from_pretrained(model_name)
 
         def load(implementation: Optional[str]) -> nn.Module:
             kwargs = {"trust_remote_code": True}
@@ -157,42 +160,6 @@ class BaseExtractorModel(PreTrainedModel):
                 stacklevel=2,
             )
             return load("eager")
-
-    def _set_encoder_backend(self, backend: str, reason: Optional[str] = None) -> None:
-        self.encoder_backend = backend
-        self.encoder_backend_reason = reason or f"{backend} backend selected"
-        logger.info(
-            "Encoder backend resolved to %s: %s",
-            self.encoder_backend,
-            self.encoder_backend_reason,
-        )
-
-    def _guard_flashdeberta_forward(self) -> None:
-        if getattr(self, "encoder_backend", "transformers") != "flashdeberta":
-            return
-        if self.training:
-            raise RuntimeError(
-                "FlashDeBERTa is inference-only in GLiNER2; call model.eval() first"
-            )
-        if torch.is_grad_enabled():
-            raise RuntimeError(
-                "FlashDeBERTa does not support gradient-enabled GLiNER2 forward "
-                "calls; use torch.inference_mode() or torch.no_grad()"
-            )
-
-    def train(self, mode: bool = True):
-        if mode and getattr(self, "encoder_backend", "transformers") == "flashdeberta":
-            raise RuntimeError(
-                "FlashDeBERTa is inference-only in GLiNER2 and cannot enter training mode"
-            )
-        return super().train(mode)
-
-    def _compile_encoder(self, *, dynamic: bool = True) -> bool:
-        """Compile the ordinary encoder and leave FlashDeBERTa untouched."""
-        if self.encoder_backend == "flashdeberta":
-            return False
-        self.encoder = torch.compile(self.encoder, dynamic=dynamic)
-        return True
 
     def task_module_names(self) -> Tuple[str, ...]:
         raise NotImplementedError

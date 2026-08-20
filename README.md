@@ -52,17 +52,11 @@ print(result)
 
 ### Quantization and Compilation
 
-Choose FP16/BF16 and/or `torch.compile` for faster inference. The ordinary
-Transformers path needs no additional inference dependency.
+Enable fp16 and/or `torch.compile` for faster inference — no extra dependencies required.
 
 ```python
 # fp16
 model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", quantize=True)
-
-# Explicit dtype (FP16 and BF16 are supported)
-model = GLiNER2.from_pretrained(
-    "fastino/gliner2-base-v1", map_location="cuda", dtype="bf16"
-)
 
 # torch.compile (fused GPU kernels, first call triggers tracing)
 model = GLiNER2.from_pretrained("fastino/gliner2-base-v1", map_location="cuda", compile=True)
@@ -828,37 +822,26 @@ results = extractor.extract(text, schema)
 # Output: {'user': [{'username': 'john_doe'}]}  # Only valid usernames
 ```
 
-## FlashDeBERTa (Optional GPU Acceleration)
+## FlashDeberta (Optional GPU Acceleration)
 
-Standard FlashAttention-2 cannot preserve DeBERTa's content-to-position and
-position-to-content attention terms. For DeBERTa-v2/v3 encoders, GLiNER2 can
-instead use [FlashDeBERTa](https://github.com/Knowledgator/FlashDeBERTa), which
-implements those terms in its Triton kernels.
+For DebertaV2-based models, you can use [FlashDeberta](https://github.com/fastino-ai/flashdeberta) to accelerate inference on GPU via flash attention kernels.
 
 **Install:**
 
 ```bash
-pip install 'gliner2[local,flash]'
+pip install flashdeberta
 ```
 
-The optional extra pins the validated release, `flashdeberta==0.0.7`.
-FlashDeBERTa requires Python 3.10+, CUDA, FP16 or BF16, and a GPU with compute
-capability 8.0 or newer.
-
-**Use and inspect the effective backend:**
+**Use:**
 
 ```python
+import os
+os.environ["USE_FLASHDEBERTA"] = "1"  # set before importing gliner2
+
 from gliner2 import GLiNER2
 
-extractor = GLiNER2.from_pretrained(
-    "fastino/gliner2-base-v1",
-    map_location="cuda",
-    dtype="bf16",                 # "fp16" is also supported
-    encoder_backend="auto",       # the default
-    compile=True,
-)
-print(extractor.encoder_backend)        # flashdeberta or transformers
-print(extractor.encoder_backend_reason) # why auto made that choice
+extractor = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+# Prints: "Using FlashDeberta backend."
 
 result = extractor.extract_entities(
     "Apple CEO Tim Cook announced iPhone 15 in Cupertino.",
@@ -866,37 +849,13 @@ result = extractor.extract_entities(
 )
 ```
 
-`encoder_backend="auto"` selects FlashDeBERTa only for a DeBERTa-v2/v3
-checkpoint loaded directly onto CUDA in FP16/BF16, on compute capability 8.0+,
-with the pinned supported package installed. Otherwise it keeps the Transformers
-encoder and records the reason. CPU and MPS always use Transformers. Loading on
-CPU and moving to CUDA later does not reselect a backend; pass the intended
-CUDA destination while loading.
+The flag is only effective when the model uses a DebertaV2 encoder and the `flashdeberta` package is installed. Otherwise standard HuggingFace `AutoModel` is used automatically.
 
-Use `encoder_backend="transformers"` to force the baseline. An explicit
-`encoder_backend="flashdeberta"` request raises a clear error if any requirement
-is missing; it never silently falls back. `USE_FLASHDEBERTA=1` remains as a
-deprecated compatibility override and is subject to the same checks.
-
-FlashDeBERTa support is inference-only: training, gradient-enabled forwards,
-and `output_attentions=True` are rejected. With `compile=True`, GLiNER2 leaves
-the handwritten Triton encoder unwrapped and still compiles the span/count or
-boundary-head components. The ordinary Transformers encoder continues to be
-compiled.
-
-FlashDeBERTa is under active development. Run the separate-process FP16/BF16
-parity and performance gate on the deployment GPU before relying on it:
+A benchmark script is included to compare the two backends:
 
 ```bash
-python benchmarks/compare_flashdeberta.py --dtype both
+python benchmarks/benchmark_flashdeberta.py
 ```
-
-The comparison covers real documents and NER, classification, relations,
-structures, and mixed schemas through 512 tokens. It checks hidden/schema/text
-states, raw logits, probabilities, threshold crossings, final documents,
-batch/padding invariance, latency percentiles, throughput, and allocated and
-reserved peak CUDA memory. A non-zero exit means FlashDeBERTa did not meet the
-document-parity, leakage, E2E improvement, p95, or 5% memory gates on that GPU.
 
 ## 📦 Batch Processing
 

@@ -27,10 +27,6 @@ from transformers import AutoConfig, AutoModel, AutoTokenizer
 from gliner2.configuration import BoundaryHeadSettings, ExtractorConfig
 from gliner2.layers import create_mlp
 from gliner2.models.base import BaseExtractorModel, EncodedBatch
-from gliner2.models.encoder_backend import (
-    resolve_encoder_backend,
-    resolve_load_dtype,
-)
 from gliner2.models.boundary.encoding import BoundaryEncoder
 from gliner2.models.boundary.constants import MASK_LOGIT
 from gliner2.models.boundary.heads import BoundaryMarginals, BoundaryQueryHead
@@ -967,14 +963,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 total = total + parameter.sum() * 0.0
         return total
 
-    def __init__(
-        self,
-        config: ExtractorConfig,
-        encoder_config=None,
-        tokenizer=None,
-        encoder_backend: str = "transformers",
-        encoder_backend_reason: Optional[str] = None,
-    ):
+    def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
         super().__init__(config)
         if config.architecture != "boundary":
             raise ValueError(
@@ -982,7 +971,6 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 f"got {config.architecture!r}"
             )
         self.config = config
-        self._set_encoder_backend(encoder_backend, encoder_backend_reason)
 
         from gliner2.processor import SchemaTransformer
         if tokenizer is not None:
@@ -994,7 +982,6 @@ class BoundaryExtractorModel(BaseExtractorModel):
             config.model_name,
             encoder_config,
             getattr(config, "attn_implementation", "sdpa"),
-            encoder_backend=self.encoder_backend,
         )
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
         self.hidden_size = self.encoder.config.hidden_size
@@ -1050,7 +1037,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
         """Compile the backbone and tensor-heavy boundary regions in place."""
         if not hasattr(torch, "compile"):
             raise RuntimeError("BoundaryExtractorModel.compile requires torch.compile")
-        self._compile_encoder(dynamic=dynamic)
+        self.encoder = torch.compile(self.encoder, dynamic=dynamic)
         self.boundary_head.boundary_encoder = torch.compile(
             self.boundary_head.boundary_encoder, dynamic=dynamic
         )
@@ -1072,11 +1059,6 @@ class BoundaryExtractorModel(BaseExtractorModel):
             )
         return self
 
-    def quantize(self) -> "BoundaryExtractorModel":
-        """Convert model parameters to FP16 (historical quantize path)."""
-        self.half()
-        return self
-
     # =========================================================================
     # Encoding
     # =========================================================================
@@ -1091,7 +1073,6 @@ class BoundaryExtractorModel(BaseExtractorModel):
         scored by the shared classifier. No fixed cross-sample query layout is
         required, so training-time task shuffling is handled naturally.
         """
-        self._guard_flashdeberta_forward()
         device = next(self.parameters()).device
         batch = batch.to(device)
         outputs = self.encoder(input_ids=batch.input_ids, attention_mask=batch.attention_mask)
@@ -1514,7 +1495,6 @@ class BoundaryExtractorModel(BaseExtractorModel):
         gold_injection_prob: Optional[float] = None,
         collect_diagnostics: Optional[bool] = None,
     ) -> ExtractorOutput:
-        self._guard_flashdeberta_forward()
         core = self._encode_core(batch)
         targets = getattr(batch, "targets", None)
         if targets is None and self.training:
@@ -1748,9 +1728,6 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         config = kwargs.pop("config", None)
         map_location = kwargs.pop("map_location", None)
-        quantize = kwargs.pop("quantize", False)
-        requested_dtype = kwargs.pop("dtype", None)
-        encoder_backend = kwargs.pop("encoder_backend", "auto")
         compile_model = kwargs.pop("compile", False)
 
         def download_or_local(repo, filename):
@@ -1763,21 +1740,8 @@ class BoundaryExtractorModel(BaseExtractorModel):
         encoder_config = AutoConfig.from_pretrained(
             download_or_local(repo_or_dir, "encoder_config/config.json")
         )
-        effective_dtype = resolve_load_dtype(requested_dtype, quantize=quantize)
-        backend_resolution = resolve_encoder_backend(
-            encoder_backend,
-            encoder_config=encoder_config,
-            map_location=map_location,
-            effective_dtype=effective_dtype,
-        )
         tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
-        model = cls(
-            config,
-            encoder_config=encoder_config,
-            tokenizer=tokenizer,
-            encoder_backend=backend_resolution.backend,
-            encoder_backend_reason=backend_resolution.reason,
-        )
+        model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
 
         try:
             state_dict = load_file(download_or_local(repo_or_dir, "model.safetensors"))
@@ -1787,13 +1751,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 map_location="cpu", weights_only=True,
             )
         try:
-            incompatible = model.load_state_dict(state_dict, strict=True)
-            if incompatible.missing_keys or incompatible.unexpected_keys:
-                raise RuntimeError(
-                    "strict checkpoint load failed for the selected encoder backend: "
-                    f"missing={incompatible.missing_keys}, "
-                    f"unexpected={incompatible.unexpected_keys}"
-                )
+            model.load_state_dict(state_dict)
         except RuntimeError as exc:
             raise RuntimeError(
                 f"Checkpoint at {repo_or_dir!r} does not match this model's "
@@ -1811,16 +1769,8 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         model.config._name_or_path = repo_or_dir
         model.name_or_path = repo_or_dir
-        if quantize:
-            model.quantize()
-        elif effective_dtype is not None:
-            model.to(dtype=effective_dtype)
-        # Keep the temporary FP32 checkpoint copy on CPU rather than doubling
-        # peak CUDA allocation during an FP16/BF16 load.
         if map_location is not None:
             model = model.to(map_location)
-        if model.encoder_backend == "flashdeberta":
-            model.eval()
         if compile_model:
             model.compile(dynamic=True)
         return model
