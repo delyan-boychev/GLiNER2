@@ -22,6 +22,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Union, Tuple, TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,13 @@ class ExtractorRuntimeMixin:
     # opt into resilient extraction, where failures are logged and the offending
     # sample yields ``{}``.
     strict_extraction: bool = True
+
+    # Accelerator decoding used to synchronize once for every predicted count,
+    # span-index list, and confidence value consumed by Python.  Keep the
+    # neural operations on-device, then transfer their outputs in two batches:
+    # counts first, followed by the count-dependent scores.  Setting this to
+    # False is an immediate per-model kill switch.
+    sync_collapsed_decode: bool = True
 
     @classmethod
     def from_api(cls, api_key: str = None, api_base_url: str = None,
@@ -238,6 +246,20 @@ class ExtractorRuntimeMixin:
             for idx, si in zip(span_samples, span_results):
                 all_span_info[idx] = si
 
+        if (
+            batch.input_ids.device.type in ("cuda", "mps")
+            and getattr(self, "sync_collapsed_decode", True)
+            and getattr(self, "strict_extraction", True)
+        ):
+            try:
+                return self._extract_from_batch_sync_collapsed(
+                    batch, all_schema_embs, all_span_info,
+                    threshold, metadata_list, include_confidence, include_spans,
+                )
+            except Exception:
+                logger.exception("accelerator extraction failed during collapsed decode")
+                raise
+
         results = []
 
         for i in range(len(batch)):
@@ -264,6 +286,191 @@ class ExtractorRuntimeMixin:
                 if getattr(self, "strict_extraction", True):
                     raise
                 results.append({})
+
+        return results
+
+    def _extract_from_batch_sync_collapsed(
+        self,
+        batch: PreprocessedBatch,
+        all_schema_embs: List[List[List[torch.Tensor]]],
+        all_span_info: List[Optional[Dict]],
+        threshold: float,
+        metadata_list: List[Dict],
+        include_confidence: bool,
+        include_spans: bool,
+    ) -> List[Dict[str, Any]]:
+        """Decode an accelerator batch with two grouped device reads.
+
+        Count predictions must reach Python before the variable-count query
+        module can run.  All counts are therefore read together, followed by a
+        single packed transfer of classification probabilities and span scores.
+        The existing CPU-safe decoders then consume those unchanged values in
+        original sample/schema order.
+        """
+        records: List[Dict[str, Any]] = []
+        count_tensors: List[torch.Tensor] = []
+        value_tensors: List[torch.Tensor] = []
+        value_offset = 0
+
+        def pack_tensor(
+            record: Dict[str, Any], key: str, value: torch.Tensor
+        ) -> None:
+            nonlocal value_offset
+            element_count = value.numel()
+            record[key] = (value_offset, element_count, value.shape)
+            value_tensors.append(value.reshape(-1))
+            value_offset += element_count
+
+        for sample_index in range(len(batch)):
+            schema = batch.original_schemas[sample_index]
+            cls_fields: Dict[str, Any] = {}
+            for struct in schema.get("json_structures", []):
+                for parent, fields in struct.items():
+                    for field_name, field_value in fields.items():
+                        if isinstance(field_value, dict) and "choices" in field_value:
+                            cls_fields[f"{parent}.{field_name}"] = field_value["choices"]
+
+            for task_index, (schema_tokens, task_type) in enumerate(zip(
+                batch.schema_tokens_list[sample_index],
+                batch.task_types[sample_index],
+            )):
+                if (
+                    len(schema_tokens) < 4
+                    or not all_schema_embs[sample_index][task_index]
+                ):
+                    continue
+
+                schema_name = schema_tokens[2].split(" [DESCRIPTION] ")[0]
+                embs = torch.stack(all_schema_embs[sample_index][task_index])
+
+                if task_type == "classifications":
+                    computed = self._compute_classification_probabilities(
+                        schema, embs, schema_tokens
+                    )
+                    if computed is None:
+                        continue
+                    schema_name, cls_config, probabilities = computed
+                    record = {
+                        "kind": "classification",
+                        "sample_index": sample_index,
+                        "schema_name": schema_name,
+                        "classification_config": cls_config,
+                    }
+                    pack_tensor(record, "probabilities", probabilities)
+                    records.append(record)
+                    continue
+
+                field_names = [
+                    schema_tokens[index + 1]
+                    for index in range(len(schema_tokens) - 1)
+                    if schema_tokens[index] in ("[E]", "[C]", "[R]")
+                ]
+                record = {
+                    "kind": "span",
+                    "sample_index": sample_index,
+                    "schema_name": schema_name,
+                    "task_type": task_type,
+                    "field_names": field_names,
+                    "cls_fields": cls_fields,
+                    "embs": embs,
+                }
+                if field_names:
+                    record["count_index"] = len(count_tensors)
+                    count_tensors.append(
+                        self.count_pred(embs[0].unsqueeze(0)).argmax(dim=1)
+                    )
+                else:
+                    record["empty_fields"] = True
+                records.append(record)
+
+        # First synchronization: one small transfer for every predicted count.
+        counts = torch.cat(count_tensors).tolist() if count_tensors else []
+
+        for record in records:
+            if record["kind"] != "span" or record.get("empty_fields"):
+                continue
+            predicted_count = int(counts[record["count_index"]])
+            record["predicted_count"] = predicted_count
+            sample_index = record["sample_index"]
+            span_info = all_span_info[sample_index]
+            if predicted_count <= 0 or span_info is None:
+                continue
+
+            struct_proj = self.count_embed(record["embs"][1:], predicted_count)
+            raw_logits = self._compute_span_logits(
+                span_info["span_rep"], struct_proj
+            )
+            span_scores = torch.sigmoid(raw_logits)
+
+            # Entity decoding consumes only structural instance zero.  Avoid
+            # transferring unused instances when the count head predicts more.
+            if record["schema_name"] == "entities":
+                raw_logits = raw_logits[:1]
+                span_scores = span_scores[:1]
+            pack_tensor(record, "span_scores", span_scores)
+
+            if (
+                record["schema_name"] == "entities"
+                and metadata_list[sample_index].get("entity_attribute_groups")
+            ):
+                pack_tensor(record, "raw_logits", raw_logits)
+
+        # Second synchronization: all values needed by Python decoding arrive
+        # together.  Copying preserves FP16/BF16/FP32 values exactly.
+        packed_values = (
+            torch.cat(value_tensors).cpu()
+            if value_tensors
+            else torch.empty(0)
+        )
+        value_tensors.clear()
+
+        def unpack_tensor(reference: Tuple[int, int, torch.Size]) -> torch.Tensor:
+            offset, element_count, shape = reference
+            return packed_values[offset:offset + element_count].reshape(shape)
+
+        results: List[Dict[str, Any]] = [{} for _ in range(len(batch))]
+        for record in records:
+            sample_index = record["sample_index"]
+            schema_name = record["schema_name"]
+            if record["kind"] == "classification":
+                self._decode_classification_probabilities(
+                    results[sample_index],
+                    schema_name,
+                    record["classification_config"],
+                    unpack_tensor(record["probabilities"]),
+                )
+                continue
+
+            task_type = record["task_type"]
+            if record.get("empty_fields"):
+                results[sample_index][schema_name] = (
+                    [] if schema_name == "entities" else {}
+                )
+                continue
+
+            predicted_count = record["predicted_count"]
+            if predicted_count <= 0 or all_span_info[sample_index] is None:
+                if schema_name == "entities" or task_type == "relations":
+                    results[sample_index][schema_name] = []
+                else:
+                    results[sample_index][schema_name] = {}
+                continue
+
+            span_scores = unpack_tensor(record["span_scores"])
+            raw_logits = (
+                unpack_tensor(record["raw_logits"])
+                if "raw_logits" in record
+                else torch.empty(0)
+            )
+            self._decode_span_probabilities(
+                results[sample_index], schema_name, task_type,
+                record["field_names"], span_scores, raw_logits,
+                predicted_count, len(batch.start_mappings[sample_index]),
+                batch.text_tokens[sample_index], batch.original_texts[sample_index],
+                batch.start_mappings[sample_index], batch.end_mappings[sample_index],
+                threshold, metadata_list[sample_index], record["cls_fields"],
+                include_confidence, include_spans,
+            )
 
         return results
 
@@ -354,10 +561,28 @@ class ExtractorRuntimeMixin:
         temperature: float = 1.0,
     ):
         """Extract classification result."""
+        computed = self._compute_classification_probabilities(
+            schema, embs, schema_tokens, temperature
+        )
+        if computed is None:
+            return
+        schema_name, cls_config, probs = computed
+        self._decode_classification_probabilities(
+            results, schema_name, cls_config, probs
+        )
+
+    def _compute_classification_probabilities(
+        self,
+        schema: Dict,
+        embs: torch.Tensor,
+        schema_tokens: List[str],
+        temperature: float = 1.0,
+    ) -> Optional[Tuple[str, Dict, torch.Tensor]]:
+        """Compute classification probabilities without reading device values."""
         prompt_str = schema_tokens[2]
         cls_config = self._resolve_classification_config(prompt_str, schema.get("classifications", []))
         if cls_config is None:
-            return
+            return None
         schema_name = cls_config["task"]
 
         cls_embeds = embs[1:]
@@ -375,8 +600,20 @@ class ExtractorRuntimeMixin:
         else:
             probs = torch.sigmoid(logits) if is_multi else torch.softmax(logits, dim=-1)
 
+        return schema_name, cls_config, probs
+
+    @staticmethod
+    def _decode_classification_probabilities(
+        results: Dict,
+        schema_name: str,
+        cls_config: Dict,
+        probs: torch.Tensor,
+    ) -> None:
+        """Decode already-computed probabilities on either CPU or accelerator."""
+
         labels = cls_config["labels"]
         cls_threshold = cls_config.get("cls_threshold", 0.5)
+        is_multi = cls_config.get("multi_label", False)
 
         if is_multi:
             chosen = [(labels[j], probs[j].item()) for j in range(len(labels)) if probs[j].item() >= cls_threshold]
@@ -430,10 +667,58 @@ class ExtractorRuntimeMixin:
             return
 
         struct_proj = self.count_embed(embs[1:], pred_count)
-        raw_logits = torch.einsum(
-            "lkd,bpd->bplk", span_info["span_rep"], struct_proj
+        raw_logits = self._compute_span_logits(
+            span_info["span_rep"], struct_proj
         )
         span_scores = torch.sigmoid(raw_logits)
+
+        self._decode_span_probabilities(
+            results, schema_name, task_type, field_names, span_scores,
+            raw_logits, pred_count, text_len, text_tokens, original_text,
+            start_mapping, end_mapping, threshold, metadata, cls_fields,
+            include_confidence, include_spans,
+        )
+
+    def _compute_span_logits(
+        self,
+        span_rep: torch.Tensor,
+        struct_proj: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score fields against spans using a single flattened linear GEMM.
+
+        Flattening the span axes maps the contraction directly to the
+        backend's linear/matrix-multiplication implementation.
+        """
+        text_length, max_width, hidden_size = span_rep.shape
+        logits = F.linear(
+            struct_proj,
+            span_rep.reshape(text_length * max_width, hidden_size),
+        )
+        return logits.reshape(
+            struct_proj.shape[0], struct_proj.shape[1], text_length, max_width
+        )
+
+    def _decode_span_probabilities(
+        self,
+        results: Dict,
+        schema_name: str,
+        task_type: str,
+        field_names: List[str],
+        span_scores: torch.Tensor,
+        raw_logits: torch.Tensor,
+        pred_count: int,
+        text_len: int,
+        text_tokens: List[str],
+        original_text: str,
+        start_mapping: List[int],
+        end_mapping: List[int],
+        threshold: float,
+        metadata: Dict,
+        cls_fields: Dict,
+        include_confidence: bool,
+        include_spans: bool,
+    ) -> None:
+        """Decode precomputed span probabilities without invoking model layers."""
 
         if schema_name == "entities":
             if metadata.get("entity_attribute_groups"):

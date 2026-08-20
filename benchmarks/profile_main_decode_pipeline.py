@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Profile main's CUDA inference pipeline and synchronized entity decoder.
 
-This is intentionally a plain-entity inference experiment.  The optimized
-prototype preserves every neural operation and its original input shape.  It
-only changes when device values are read by Python:
+This is intentionally a plain-entity inference workload.  The optimized path
+uses the production synchronization-collapsed decoder.  It changes when device
+values are read by Python:
 
 * predicted counts are transferred together instead of via one ``.item()`` per
   document;
@@ -20,8 +20,6 @@ import hashlib
 import json
 import statistics
 import time
-from collections import OrderedDict
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Sequence, Tuple
 
@@ -137,14 +135,6 @@ def raw_default_decode(
     return results
 
 
-def _entity_fields(schema_tokens: Sequence[str]) -> List[str]:
-    return [
-        schema_tokens[index + 1]
-        for index in range(len(schema_tokens) - 1)
-        if schema_tokens[index] in ("[E]", "[C]", "[R]")
-    ]
-
-
 def raw_optimized_decode(
     model,
     batch,
@@ -156,87 +146,12 @@ def raw_optimized_decode(
     include_confidence: bool,
     include_spans: bool,
 ):
-    """Collapse device reads while preserving all model-side operation shapes."""
-    del token_embs  # Span representations and schema embeddings are sufficient.
-    records = []
-    count_indices = []
-    results: List[Dict[str, Any]] = [{} for _ in range(len(batch))]
-
-    for sample_index in range(len(batch)):
-        if len(batch.task_types[sample_index]) != 1:
-            raise ValueError("optimized prototype requires one entity schema per document")
-        if batch.task_types[sample_index][0] != "entities":
-            raise ValueError("optimized prototype currently supports entity extraction only")
-        schema_tokens = batch.schema_tokens_list[sample_index][0]
-        fields = _entity_fields(schema_tokens)
-        schema_name = schema_tokens[2].split(" [DESCRIPTION] ")[0]
-        if len(schema_tokens) < 4 or not schema_embs[sample_index][0] or not fields:
-            results[sample_index][schema_name] = []
-            continue
-
-        embs = torch.stack(schema_embs[sample_index][0])
-        # Keep the original [1, H] count-head call and [1, 20] argmax shape.
-        count_logits = model.count_pred(embs[0].unsqueeze(0))
-        count_indices.append(count_logits.argmax(dim=1))
-        records.append((sample_index, schema_name, fields, embs))
-
-    # First and only pre-scoring synchronization: all predicted counts at once.
-    counts = (
-        torch.cat(count_indices, dim=0).tolist() if count_indices else []
+    """Run the production synchronization-collapsed decoder."""
+    del token_embs
+    return model._extract_from_batch_sync_collapsed(
+        batch, schema_embs, span_info, threshold, metadata,
+        include_confidence, include_spans,
     )
-
-    score_tensors = []
-    score_records = []
-    for (sample_index, schema_name, fields, embs), predicted_count in zip(records, counts):
-        predicted_count = int(predicted_count)
-        if predicted_count <= 0 or span_info[sample_index] is None:
-            results[sample_index][schema_name] = []
-            continue
-
-        # These calls and their shapes are identical to the default decoder.
-        struct_proj = model.count_embed(embs[1:], predicted_count)
-        raw_logits = torch.einsum(
-            "lkd,bpd->bplk", span_info[sample_index]["span_rep"], struct_proj
-        )
-        span_scores = torch.sigmoid(raw_logits)
-
-        # Entity decoding consumes structural instance zero.  Packing is only a
-        # value-preserving copy; it is unrelated to encoder sequence packing.
-        entity_scores = span_scores[0]
-        score_tensors.append(entity_scores.reshape(-1))
-        score_records.append((
-            sample_index,
-            schema_name,
-            fields,
-            entity_scores.shape,
-        ))
-
-    # One post-scoring transfer replaces per-field .tolist() and per-candidate
-    # confidence .item() calls.  FP16/BF16/FP32 values are copied bit-for-bit.
-    packed_cpu = (
-        torch.cat(score_tensors, dim=0).cpu()
-        if score_tensors else torch.empty(0)
-    )
-    offset = 0
-    for sample_index, schema_name, fields, shape in score_records:
-        element_count = shape.numel()
-        entity_scores = packed_cpu[offset:offset + element_count].reshape(shape)
-        offset += element_count
-        results[sample_index][schema_name] = model._extract_entities(
-            fields,
-            entity_scores.unsqueeze(0),
-            len(batch.start_mappings[sample_index]),
-            batch.text_tokens[sample_index],
-            batch.original_texts[sample_index],
-            batch.start_mappings[sample_index],
-            batch.end_mappings[sample_index],
-            threshold,
-            metadata[sample_index],
-            include_confidence,
-            include_spans,
-        )
-
-    return results
 
 
 def format_batch(model, raw, metadata, include_confidence):
