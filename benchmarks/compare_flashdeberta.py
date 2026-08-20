@@ -400,18 +400,24 @@ def worker(args) -> None:
     torch.save(payload, args.artifact)
 
 
-def compare_tensors(standard, flash, dtype: str) -> List[str]:
+def compare_tensors(standard, flash, dtype: str) -> Tuple[List[str], Dict[str, Any]]:
     import torch
 
     failures = []
     tolerance = TOLERANCES[dtype]
+    precision: Dict[str, Any] = {}
     for case, standard_snapshot in standard["snapshots"].items():
         flash_snapshot = flash["snapshots"][case]
-        if standard_snapshot["formatted"] != flash_snapshot["formatted"]:
+        formatted_exact = standard_snapshot["formatted"] == flash_snapshot["formatted"]
+        if not formatted_exact:
             failures.append(f"{case}: formatted output mismatch")
+        max_error = 0.0
+        crossings_exact = True
+        count_mismatch = False
         for name, standard_tensors in standard_snapshot["tensors"].items():
             flash_tensors = flash_snapshot["tensors"][name]
             if len(standard_tensors) != len(flash_tensors):
+                count_mismatch = True
                 failures.append(
                     f"{case}/{name}: tensor count {len(standard_tensors)} != "
                     f"{len(flash_tensors)}"
@@ -421,6 +427,7 @@ def compare_tensors(standard, flash, dtype: str) -> List[str]:
                 zip(standard_tensors, flash_tensors)
             ):
                 if expected.shape != actual.shape:
+                    count_mismatch = True
                     failures.append(
                         f"{case}/{name}[{index}]: shape {tuple(expected.shape)} "
                         f"!= {tuple(actual.shape)}"
@@ -428,17 +435,27 @@ def compare_tensors(standard, flash, dtype: str) -> List[str]:
                     continue
                 if name == "threshold_crossings":
                     if not torch.equal(expected, actual):
+                        crossings_exact = False
                         failures.append(f"{case}/{name}[{index}]: crossing mismatch")
-                elif not torch.allclose(expected.float(), actual.float(), **tolerance):
-                    max_error = (expected.float() - actual.float()).abs().max().item()
+                    continue
+                error = (expected.float() - actual.float()).abs().max().item()
+                max_error = max(max_error, error)
+                if not torch.allclose(expected.float(), actual.float(), **tolerance):
                     failures.append(
-                        f"{case}/{name}[{index}]: max abs error {max_error:.6g}"
+                        f"{case}/{name}[{index}]: max abs error {error:.6g}"
                     )
-    return failures
+        precision[case] = {
+            "formatted_exact": formatted_exact,
+            "tensor_counts_match": not count_mismatch,
+            "max_abs_error": max_error,
+            "within_tolerance": not count_mismatch and max_error <= tolerance["atol"],
+            "threshold_crossings_exact": crossings_exact,
+        }
+    return failures, precision
 
 
 def acceptance_report(standard, flash, dtype: str) -> Dict[str, Any]:
-    parity_failures = compare_tensors(standard, flash, dtype)
+    parity_failures, precision = compare_tensors(standard, flash, dtype)
     consistency = standard["consistency_issues"] + flash["consistency_issues"]
     performance_failures = []
     speedups = []
@@ -489,6 +506,7 @@ def acceptance_report(standard, flash, dtype: str) -> Dict[str, Any]:
         "batch_padding_leakage_failures": consistency,
         "performance_failures": performance_failures,
         "overall_median_speedup": statistics.median(speedups),
+        "precision": precision,
         "conditions": rows,
     }
 
@@ -533,7 +551,7 @@ def parse_args():
 
 
 def print_speedup_tables(reports: Dict[str, Any]) -> None:
-    """Print per-dtype, per-schema batch x doc-length median-speedup matrices."""
+    """Print per-dtype speedup matrices and the tensor/formatted parity results."""
     for dtype, report in reports.items():
         rows = report["conditions"]
         lengths = sorted({int(key.split("_l")[1].split("_b")[0]) for key in rows})
@@ -549,6 +567,26 @@ def print_speedup_tables(reports: Dict[str, Any]) -> None:
                     speedup = rows[f"{schema}_l{length}_b{batch}"]["median_speedup"]
                     cells.append(f"{speedup:>7.2f}x")
                 print(f"  {batch:<8}" + "".join(cells))
+
+        precision = report.get("precision")
+        if precision:
+            tolerance = report["tolerances"]
+            print(f"\n  precision parity (atol={tolerance['atol']} rtol={tolerance['rtol']})")
+            print(
+                f"  {'case':<28}{'formatted':>12}{'max abs err':>14}"
+                f"{'crossings':>12}{'within tol':>12}"
+            )
+            for case, entry in sorted(precision.items()):
+                formatted = "exact" if entry["formatted_exact"] else "MISMATCH"
+                crossings = (
+                    "exact" if entry["threshold_crossings_exact"] else "MISMATCH"
+                )
+                within = "yes" if entry["within_tolerance"] else "NO"
+                print(
+                    f"  {case:<28}{formatted:>12}"
+                    f"{entry['max_abs_error']:>14.3e}"
+                    f"{crossings:>12}{within:>12}"
+                )
 
 
 def main() -> None:
