@@ -772,6 +772,7 @@ def main() -> int:
                     # that a later invocation overwrites. Clone immediately.
                     path_output = path_output.detach().clone()
                     outputs[path_name] = path_output
+                    del path_output
                     path_ms = latency["median_ms"]
                     if path_name == "legacy":
                         legacy_ms = path_ms
@@ -825,28 +826,46 @@ def main() -> int:
                         flush=True,
                     )
                     continue
-                difference = (
-                    outputs[left_name].float() - outputs[right_name].float()
-                ).abs()
-                max_error = float(difference.max().item())
-                mean_error = float(difference.mean().item())
-                sum_error = float(difference.sum().item())
-                comparison = {
-                    "left": left_name,
-                    "right": right_name,
-                    "status": "ok",
-                    "max_abs_error": max_error,
-                    "mean_abs_error": mean_error,
-                    "sum_abs_error": sum_error,
-                    "numel": difference.numel(),
-                }
-                case_record["numerical_comparisons"].append(comparison)
-                print(
-                    f"  {left_name} vs {right_name}: "
-                    f"max_abs={max_error:.6g} | mean_abs={mean_error:.6g}",
-                    flush=True,
-                )
-                del difference
+                try:
+                    difference = (
+                        outputs[left_name].float() - outputs[right_name].float()
+                    ).abs()
+                    max_error = float(difference.max().item())
+                    mean_error = float(difference.mean().item())
+                    sum_error = float(difference.sum().item())
+                    comparison = {
+                        "left": left_name,
+                        "right": right_name,
+                        "status": "ok",
+                        "max_abs_error": max_error,
+                        "mean_abs_error": mean_error,
+                        "sum_abs_error": sum_error,
+                        "numel": difference.numel(),
+                    }
+                    case_record["numerical_comparisons"].append(comparison)
+                    print(
+                        f"  {left_name} vs {right_name}: "
+                        f"max_abs={max_error:.6g} | mean_abs={mean_error:.6g}",
+                        flush=True,
+                    )
+                    del difference
+                except Exception as exc:
+                    comparison = {
+                        "left": left_name,
+                        "right": right_name,
+                        "status": "error",
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    }
+                    case_record["numerical_comparisons"].append(comparison)
+                    print(
+                        f"  ERROR comparing {left_name} vs {right_name}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
 
             del outputs
             del input_ids, attention_mask
