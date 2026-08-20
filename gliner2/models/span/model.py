@@ -751,14 +751,16 @@ class SpanExtractorModel(BaseExtractorModel):
         model.config._name_or_path = repo_or_dir
         model.name_or_path = repo_or_dir
 
-        if map_location is not None:
-            model = model.to(map_location)
-
         if quantize:
             model.quantize()
         elif effective_dtype is not None:
             model.to(dtype=effective_dtype)
             logger.info("Converted model to %s", effective_dtype)
+
+        # Cast before the device transfer so an FP16/BF16 CUDA load does not
+        # transiently allocate a full FP32 copy of the model on the GPU.
+        if map_location is not None:
+            model = model.to(map_location)
 
         if model.encoder_backend == "flashdeberta":
             model.eval()

@@ -242,11 +242,16 @@ def resolve_encoder_backend(
         )
 
     major, minor = caps.cuda_capability or (0, 0)
+    selection = (
+        "explicit FlashDeBERTa request validated"
+        if requested == "flashdeberta"
+        else "automatic requirements satisfied"
+    )
     return EncoderBackendResolution(
         requested=requested,
         backend="flashdeberta",
         reason=(
-            "automatic requirements satisfied: DeBERTa-v2/v3, "
+            f"{selection}: DeBERTa-v2/v3, "
             f"CUDA capability {major}.{minor}, {effective_dtype}, and "
             f"flashdeberta {caps.flashdeberta_version}"
         ),

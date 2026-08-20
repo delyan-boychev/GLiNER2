@@ -1811,12 +1811,14 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         model.config._name_or_path = repo_or_dir
         model.name_or_path = repo_or_dir
-        if map_location is not None:
-            model = model.to(map_location)
         if quantize:
             model.quantize()
         elif effective_dtype is not None:
             model.to(dtype=effective_dtype)
+        # Keep the temporary FP32 checkpoint copy on CPU rather than doubling
+        # peak CUDA allocation during an FP16/BF16 load.
+        if map_location is not None:
+            model = model.to(map_location)
         if model.encoder_backend == "flashdeberta":
             model.eval()
         if compile_model:

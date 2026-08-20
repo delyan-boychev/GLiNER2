@@ -65,6 +65,14 @@ def test_auto_selects_flashdeberta_for_validated_configuration(dtype):
         ),
         (
             DebertaV2Config(), "cuda", torch.float16,
+            _caps(cuda_available=False), "CUDA is not available",
+        ),
+        (
+            DebertaV2Config(), "cuda", torch.float16,
+            _caps(python_version=(3, 9)), "requires Python 3.10+",
+        ),
+        (
+            DebertaV2Config(), "cuda", torch.float16,
             _caps(flashdeberta_version=None, flashdeberta_importable=False),
             "not installed",
         ),
