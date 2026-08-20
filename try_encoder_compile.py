@@ -6,10 +6,17 @@ Run from the repository root:
     python try_encoder_compile.py
 
 The script loads the checkpoint on CPU, keeps only its Transformers encoder,
-moves that encoder to CUDA, and exercises one ``reduce-overhead`` compiled
-wrapper with several input shapes.  Every shape prints its first-call time,
-steady-state eager/compiled latency, and numerical parity.  A failed shape is
-reported without hiding the exception or stopping the remaining cases.
+moves that encoder to CUDA, and compares three execution paths:
+
+* ``legacy``: ordinary eager PyTorch;
+* ``compiled-default``: the repository's current ``torch.compile`` call; and
+* ``reduce-overhead``: compilation with CUDA graphs where supported.
+
+Every shape prints its first-call time, steady-state latency, and pairwise
+max/mean absolute differences for compiled-default vs legacy, reduce-overhead
+vs legacy, and reduce-overhead vs compiled-default. There is deliberately no
+numerical threshold or pass/fail decision. A runtime failure is reported
+without hiding the exception or stopping the remaining cases.
 """
 
 from __future__ import annotations
@@ -28,22 +35,25 @@ import torch
 # These are deliberately plain constants so the default experiment is easy to
 # edit directly on the GPU machine.
 DEFAULT_MODEL = "fastino/gliner2-base-v1"
-DEFAULT_SHAPES = (
-    (1, 64),
-    (1, 128),
-    (1, 256),
-    (1, 476),
-    (4, 64),
-    (4, 128),
-    (4, 256),
-    (4, 476),
-    (8, 64),
-    (8, 128),
-    (8, 256),
-    (8, 476),
+DEFAULT_BATCH_SIZES = (1, 4, 8, 16, 32)
+DEFAULT_LENGTHS = (16, 32, 64, 128, 256, 512)
+DEFAULT_SHAPES = tuple(
+    (batch, length)
+    for batch in DEFAULT_BATCH_SIZES
+    for length in DEFAULT_LENGTHS
 )
 DEFAULT_WARMUP = 2
 DEFAULT_RUNS = 10
+EXECUTION_PATHS = (
+    ("legacy", None),
+    ("compiled-default", "default"),
+    ("reduce-overhead", "reduce-overhead"),
+)
+NUMERICAL_COMPARISONS = (
+    ("compiled-default", "legacy"),
+    ("reduce-overhead", "legacy"),
+    ("reduce-overhead", "compiled-default"),
+)
 
 
 def parse_shapes(value: str) -> list[tuple[int, int]]:
@@ -160,7 +170,10 @@ def median_latency(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Try the GLiNER2 encoder at several CUDA shapes with torch.compile(mode='reduce-overhead').",
+        description=(
+            "Compare the eager legacy, repository-default compiled, and "
+            "reduce-overhead GLiNER2 encoder paths at several CUDA shapes."
+        ),
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
@@ -202,8 +215,8 @@ def main() -> int:
 
     # This experiment is specifically for the ordinary Transformers encoder.
     # Prevent the legacy environment override from replacing it during load.
-    legacy_flash = os.environ.pop("USE_FLASHDEBERTA", None)
-    if legacy_flash is not None:
+    flash_override = os.environ.pop("USE_FLASHDEBERTA", None)
+    if flash_override is not None:
         print("Ignoring USE_FLASHDEBERTA for this Transformers encoder test.", flush=True)
 
     from gliner2 import GLiNER2
@@ -230,25 +243,30 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"Compile: mode=reduce-overhead dynamic={not args.static} "
-        f"fullgraph={args.fullgraph} | shapes={shape_string(args.shapes)}",
+        f"Paths: {', '.join(name for name, _ in EXECUTION_PATHS)} | "
+        f"dynamic={not args.static} fullgraph={args.fullgraph} | "
+        f"shapes={shape_string(args.shapes)}",
         flush=True,
     )
 
-    compiled_encoder = torch.compile(
-        encoder,
-        mode="reduce-overhead",
-        dynamic=not args.static,
-        fullgraph=args.fullgraph,
-    )
-    tolerance = (
-        {"atol": 2e-3, "rtol": 1e-2}
-        if args.dtype == "fp16"
-        else {"atol": 4e-3, "rtol": 2e-2}
-    )
+    execution_paths = []
+    for name, compile_mode in EXECUTION_PATHS:
+        if compile_mode is None:
+            execution_paths.append((name, encoder))
+            continue
+        compile_kwargs = {
+            "dynamic": not args.static,
+            "fullgraph": args.fullgraph,
+        }
+        # Omitting mode exactly mirrors the repository's existing encoder
+        # compilation path. Calling it mode="default" is equivalent, but this
+        # keeps the legacy measurement faithful to the production call site.
+        if compile_mode != "default":
+            compile_kwargs["mode"] = compile_mode
+        execution_paths.append((name, torch.compile(encoder, **compile_kwargs)))
 
     failures = 0
-    passed = 0
+    completed = 0
     skipped = 0
     total = len(args.shapes)
     with torch.inference_mode():
@@ -272,67 +290,85 @@ def main() -> int:
                 f"  input_ids={tuple(input_ids.shape)} mask_valid={valid_lengths}",
                 flush=True,
             )
-            try:
-                eager_ms, eager_output = median_latency(
-                    encoder, input_ids, attention_mask, args.warmup, args.runs, "eager"
-                )
 
-                # This call includes compilation or recompilation for the new
-                # shape. Keep it separate from steady-state timings.
-                print("  compiled first call (may compile/recompile)...", end="", flush=True)
-                first_output, first_ms = timed_call(
-                    compiled_encoder, input_ids, attention_mask
-                )
-                print(f" {first_ms:.3f} ms", flush=True)
-                del first_output
-                compiled_ms, compiled_output = median_latency(
-                    compiled_encoder,
-                    input_ids,
-                    attention_mask,
-                    args.warmup,
-                    args.runs,
-                    "compiled",
-                )
+            legacy_ms = None
+            outputs = {}
+            for path_name, path_encoder in execution_paths:
+                print(f"\n  --- {path_name} ---", flush=True)
+                try:
+                    compiling = path_name != "legacy"
+                    print(
+                        f"  {path_name} first call"
+                        + (" (may compile/recompile)" if compiling else "")
+                        + "...",
+                        end="",
+                        flush=True,
+                    )
+                    first_output, first_ms = timed_call(
+                        path_encoder, input_ids, attention_mask
+                    )
+                    print(f" {first_ms:.3f} ms", flush=True)
+                    del first_output
 
-                # reduce-overhead may return CUDA-graph-managed buffers that a
-                # later invocation overwrites. Clone before any further call.
-                compiled_output = compiled_output.detach().clone()
-                eager_output = eager_output.detach().clone()
-                difference = (eager_output.float() - compiled_output.float()).abs()
+                    path_ms, path_output = median_latency(
+                        path_encoder,
+                        input_ids,
+                        attention_mask,
+                        args.warmup,
+                        args.runs,
+                        path_name,
+                    )
+
+                    # reduce-overhead may return CUDA-graph-managed buffers
+                    # that a later invocation overwrites. Clone immediately.
+                    path_output = path_output.detach().clone()
+                    outputs[path_name] = path_output
+                    if path_name == "legacy":
+                        legacy_ms = path_ms
+                    speedup = legacy_ms / path_ms if legacy_ms is not None else None
+                    speedup_text = (
+                        f" | vs_legacy={speedup:.2f}x" if speedup is not None else ""
+                    )
+                    print(
+                        f"  RESULT {path_name}: first={first_ms:.3f} ms | "
+                        f"median={path_ms:.3f} ms{speedup_text}",
+                        flush=True,
+                    )
+                    completed += 1
+                except Exception as exc:  # one mode must not hide the others
+                    failures += 1
+                    print(
+                        f"  ERROR {path_name}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    print(traceback.format_exc(), flush=True)
+
+            print("\n  --- numerical differences ---", flush=True)
+            for left_name, right_name in NUMERICAL_COMPARISONS:
+                if left_name not in outputs or right_name not in outputs:
+                    print(
+                        f"  {left_name} vs {right_name}: unavailable because a path failed",
+                        flush=True,
+                    )
+                    continue
+                difference = (
+                    outputs[left_name].float() - outputs[right_name].float()
+                ).abs()
                 max_error = float(difference.max().item())
                 mean_error = float(difference.mean().item())
-                parity = bool(
-                    torch.allclose(
-                        eager_output.float(), compiled_output.float(), **tolerance
-                    )
-                )
-                speedup = eager_ms / compiled_ms
-                status = "PASS" if parity else "PARITY FAIL"
                 print(
-                    f"  {status}: first_compiled={first_ms:.2f} ms | "
-                    f"eager={eager_ms:.3f} ms | compiled={compiled_ms:.3f} ms | "
-                    f"speedup={speedup:.2f}x",
+                    f"  {left_name} vs {right_name}: "
+                    f"max_abs={max_error:.6g} | mean_abs={mean_error:.6g}",
                     flush=True,
                 )
-                print(
-                    f"  max_abs={max_error:.6g} mean_abs={mean_error:.6g} "
-                    f"tolerance(atol={tolerance['atol']}, rtol={tolerance['rtol']})",
-                    flush=True,
-                )
-                if parity:
-                    passed += 1
-                else:
-                    failures += 1
-                del eager_output, compiled_output, difference
-            except Exception as exc:  # continue so one bad shape does not hide the rest
-                failures += 1
-                print(f"  ERROR: {type(exc).__name__}: {exc}", flush=True)
-                print(traceback.format_exc(), flush=True)
-            finally:
-                del input_ids, attention_mask
+                del difference
+
+            del outputs
+            del input_ids, attention_mask
 
     print(
-        f"\nSUMMARY: passed={passed} failed={failures} skipped={skipped} total={total}",
+        f"\nSUMMARY: completed_paths={completed} runtime_failures={failures} "
+        f"skipped_shapes={skipped} total_shapes={total}",
         flush=True,
     )
     return 1 if failures else 0
