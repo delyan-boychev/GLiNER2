@@ -538,9 +538,9 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--measure", type=int, default=20)
     parser.add_argument(
-        "--lengths", type=int, nargs="+", default=[64, 128, 256, 512, 1024, 2048]
+        "--lengths", type=int, nargs="+", default=[16, 32, 64, 128]
     )
-    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 32])
+    parser.add_argument("--batch-sizes", type=int, nargs="+", default=[16, 32, 64, 128, 256])
     parser.add_argument("--output", default="benchmarks/flashdeberta_comparison.json")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
