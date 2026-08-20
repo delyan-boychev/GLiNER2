@@ -6,12 +6,11 @@ Run from the repository root:
     python try_encoder_compile.py
 
 The script loads the checkpoint on CPU, keeps only its Transformers encoder,
-moves that encoder to CUDA, and compares five execution paths:
+moves that encoder to CUDA, and compares four execution paths:
 
 * ``legacy``: ordinary eager PyTorch;
 * ``compiled-default``: the repository's current ``torch.compile`` call; and
 * ``reduce-overhead``: compilation with CUDA graphs where supported;
-* ``max-autotune-dynamic``: max autotuning with dynamic shapes; and
 * ``max-autotune-buckets``: max autotuning specialized to each supplied shape.
 
 Every shape prints its first-call time, steady-state latency, and pairwise
@@ -29,6 +28,7 @@ import json
 import math
 import os
 import platform
+import random
 import statistics
 import time
 import traceback
@@ -51,12 +51,17 @@ DEFAULT_SHAPES = tuple(
 )
 DEFAULT_WARMUP = 2
 DEFAULT_RUNS = 10
+DEFAULT_STABILITY_RUNS = 2
+PADDING_PROFILES = ("none", "mixed", "extreme", "random")
+PADDING_FACTORS = {
+    "mixed": (1.0, 0.75, 0.5, 0.25),
+    "extreme": (1.0, 0.125, 0.125, 0.125),
+}
 EXECUTION_PATHS = (
     # name, torch.compile mode, dynamic
     ("legacy", None, None),
     ("compiled-default", "default", True),
     ("reduce-overhead", "reduce-overhead", True),
-    ("max-autotune-dynamic", "max-autotune", True),
     ("max-autotune-buckets", "max-autotune", False),
 )
 PATH_NAMES = tuple(name for name, _, _ in EXECUTION_PATHS)
@@ -64,6 +69,12 @@ NUMERICAL_COMPARISONS = tuple(
     (PATH_NAMES[left], PATH_NAMES[right])
     for left in range(1, len(PATH_NAMES))
     for right in range(left)
+)
+STABILITY_PATH_NAMES = ("legacy", "reduce-overhead", "max-autotune-buckets")
+STABILITY_NUMERICAL_COMPARISONS = (
+    ("reduce-overhead", "legacy"),
+    ("max-autotune-buckets", "legacy"),
+    ("max-autotune-buckets", "reduce-overhead"),
 )
 DEFAULT_OUTPUT = Path("encoder_compile_results.json")
 
@@ -87,6 +98,16 @@ def parse_shapes(value: str) -> list[tuple[int, int]]:
     if not shapes:
         raise argparse.ArgumentTypeError("at least one shape is required")
     return shapes
+
+
+def parse_padding_profiles(value: str) -> list[str]:
+    profiles = [item.strip().lower() for item in value.split(",") if item.strip()]
+    invalid = [item for item in profiles if item not in PADDING_PROFILES]
+    if not profiles or invalid:
+        raise argparse.ArgumentTypeError(
+            f"expected comma-separated values from {PADDING_PROFILES}; got {invalid}"
+        )
+    return profiles
 
 
 def shape_string(shapes: Iterable[tuple[int, int]]) -> str:
@@ -134,11 +155,14 @@ def make_inputs(
     pad_token_id: int,
     padding: str,
     device: torch.device,
+    variant: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
     # A shape-specific seed makes a failed case exactly reproducible while not
     # depending on which cases ran before it.
     generator = torch.Generator(device=device)
-    generator.manual_seed(17_000 + batch * 1_000 + length)
+    profile_index = PADDING_PROFILES.index(padding)
+    seed = 17_000 + batch * 1_000 + length + profile_index * 100_000 + variant
+    generator.manual_seed(seed)
     input_ids = torch.randint(
         low=0,
         high=vocab_size,
@@ -149,15 +173,26 @@ def make_inputs(
     )
     attention_mask = torch.ones((batch, length), dtype=torch.long, device=device)
 
-    if padding == "mixed":
+    if padding in PADDING_FACTORS:
         # Includes a meaningful padded tail even for B=1, and different valid
         # lengths for larger batches. This exercises DeBERTa's mask path while
         # retaining the requested dense BxL tensor shape.
-        fractions = (1.0, 0.75, 0.5, 0.25)
+        fractions = PADDING_FACTORS[padding]
         offset = 1 if batch == 1 else 0
         valid_lengths = [
-            max(2, round(length * fractions[(index + offset) % len(fractions)]))
+            max(
+                1,
+                min(length, round(length * fractions[(index + offset) % len(fractions)])),
+            )
             for index in range(batch)
+        ]
+        for row, valid_length in enumerate(valid_lengths):
+            attention_mask[row, valid_length:] = 0
+            input_ids[row, valid_length:] = pad_token_id
+    elif padding == "random":
+        randomizer = random.Random(seed)
+        valid_lengths = [
+            randomizer.randint(min(2, length), length) for _ in range(batch)
         ]
         for row, valid_length in enumerate(valid_lengths):
             attention_mask[row, valid_length:] = 0
@@ -238,7 +273,187 @@ def geometric_mean(values: list[float]) -> float | None:
     return math.exp(sum(math.log(value) for value in positive) / len(positive))
 
 
-def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
+def stability_order(
+    shapes: list[tuple[int, int]],
+    cycle_index: int,
+) -> list[tuple[int, int]]:
+    """Return a deterministic order that repeatedly crosses bucket sizes."""
+    ordered = list(shapes)
+    if cycle_index % 4 == 0:
+        zigzag = []
+        left = 0
+        right = len(ordered) - 1
+        while left <= right:
+            zigzag.append(ordered[left])
+            left += 1
+            if left <= right:
+                zigzag.append(ordered[right])
+                right -= 1
+        return zigzag
+    if cycle_index % 4 == 1:
+        return list(reversed(ordered))
+    random.Random(91_000 + cycle_index).shuffle(ordered)
+    return ordered
+
+
+def compare_outputs(
+    outputs: dict[str, torch.Tensor],
+    indent: str = "  ",
+    comparison_pairs: tuple[tuple[str, str], ...] = NUMERICAL_COMPARISONS,
+) -> list[dict[str, Any]]:
+    comparisons = []
+    for left_name, right_name in comparison_pairs:
+        if left_name not in outputs or right_name not in outputs:
+            comparison = {
+                "left": left_name,
+                "right": right_name,
+                "status": "unavailable",
+            }
+            comparisons.append(comparison)
+            print(
+                f"{indent}{left_name} vs {right_name}: unavailable because a path failed",
+                flush=True,
+            )
+            continue
+        difference = None
+        try:
+            difference = (
+                outputs[left_name].float() - outputs[right_name].float()
+            ).abs()
+            max_error = float(difference.max().item())
+            mean_error = float(difference.mean().item())
+            sum_error = float(difference.sum().item())
+            comparison = {
+                "left": left_name,
+                "right": right_name,
+                "status": "ok",
+                "max_abs_error": max_error,
+                "mean_abs_error": mean_error,
+                "sum_abs_error": sum_error,
+                "numel": difference.numel(),
+            }
+            comparisons.append(comparison)
+            print(
+                f"{indent}{left_name} vs {right_name}: "
+                f"max_abs={max_error:.6g} | mean_abs={mean_error:.6g}",
+                flush=True,
+            )
+        except Exception as exc:
+            comparison = {
+                "left": left_name,
+                "right": right_name,
+                "status": "error",
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+            comparisons.append(comparison)
+            print(
+                f"{indent}ERROR comparing {left_name} vs {right_name}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+        finally:
+            if difference is not None:
+                del difference
+    return comparisons
+
+
+def summarize_numerical(
+    records: list[dict[str, Any]],
+    comparison_pairs: tuple[tuple[str, str], ...] = NUMERICAL_COMPARISONS,
+) -> dict[str, Any]:
+    comparison_summary = {}
+    for left_name, right_name in comparison_pairs:
+        key = f"{left_name}_vs_{right_name}"
+        rows = [
+            comparison
+            for record in records
+            for comparison in record.get("numerical_comparisons", [])
+            if comparison["left"] == left_name
+            and comparison["right"] == right_name
+            and comparison["status"] == "ok"
+        ]
+        total_values = sum(row["numel"] for row in rows)
+        total_error = sum(row["sum_abs_error"] for row in rows)
+        comparison_summary[key] = {
+            "left": left_name,
+            "right": right_name,
+            "completed_cases": len(rows),
+            "unavailable_cases": sum(
+                1
+                for record in records
+                for comparison in record.get("numerical_comparisons", [])
+                if comparison["left"] == left_name
+                and comparison["right"] == right_name
+                and comparison["status"] != "ok"
+            ),
+            "maximum_abs_error": (
+                max(row["max_abs_error"] for row in rows) if rows else None
+            ),
+            "weighted_mean_abs_error": (
+                total_error / total_values if total_values else None
+            ),
+            "compared_values": total_values,
+        }
+    return comparison_summary
+
+
+def summarize_reduce_vs_buckets(records: list[dict[str, Any]]) -> dict[str, Any]:
+    usable = [
+        record
+        for record in records
+        if record.get("paths", {}).get("reduce-overhead", {}).get("status") == "ok"
+        and record.get("paths", {}).get("max-autotune-buckets", {}).get("status")
+        == "ok"
+    ]
+    speedups = [
+        record["paths"]["reduce-overhead"]["latency"]["median_ms"]
+        / record["paths"]["max-autotune-buckets"]["latency"]["median_ms"]
+        for record in usable
+    ]
+    comparisons = [
+        comparison
+        for record in records
+        for comparison in record.get("numerical_comparisons", [])
+        if comparison["left"] == "max-autotune-buckets"
+        and comparison["right"] == "reduce-overhead"
+        and comparison["status"] == "ok"
+    ]
+    compared_values = sum(row["numel"] for row in comparisons)
+    total_error = sum(row["sum_abs_error"] for row in comparisons)
+    return {
+        "total_steps": len(records),
+        "comparable_steps": len(usable),
+        "unavailable_steps": len(records) - len(usable),
+        "bucket_wins": sum(value > 1.0 for value in speedups),
+        "reduce_overhead_wins": sum(value < 1.0 for value in speedups),
+        "ties": sum(value == 1.0 for value in speedups),
+        "geometric_mean_bucket_speedup_vs_reduce_overhead": geometric_mean(speedups),
+        "median_bucket_speedup_vs_reduce_overhead": (
+            statistics.median(speedups) if speedups else None
+        ),
+        "minimum_bucket_speedup_vs_reduce_overhead": min(speedups) if speedups else None,
+        "maximum_bucket_speedup_vs_reduce_overhead": max(speedups) if speedups else None,
+        "maximum_abs_error_bucket_vs_reduce_overhead": (
+            max(row["max_abs_error"] for row in comparisons)
+            if comparisons
+            else None
+        ),
+        "weighted_mean_abs_error_bucket_vs_reduce_overhead": (
+            total_error / compared_values if compared_values else None
+        ),
+        "compared_values": compared_values,
+    }
+
+
+def build_summary(
+    cases: list[dict[str, Any]],
+    stability_replays: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    stability_replays = stability_replays or []
     path_summary = {}
     fastest_counts = {name: 0 for name in PATH_NAMES}
     for case in cases:
@@ -309,38 +524,34 @@ def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             "total_first_call_ms": sum(row["first_call_ms"] for row in rows),
         }
 
-    comparison_summary = {}
-    for left_name, right_name in NUMERICAL_COMPARISONS:
-        key = f"{left_name}_vs_{right_name}"
+    stability_path_summary = {}
+    for path_name in STABILITY_PATH_NAMES:
         rows = [
-            comparison
-            for case in cases
-            for comparison in case.get("numerical_comparisons", [])
-            if comparison["left"] == left_name
-            and comparison["right"] == right_name
-            and comparison["status"] == "ok"
+            replay["paths"][path_name]
+            for replay in stability_replays
+            if path_name in replay.get("paths", {})
+            and replay["paths"][path_name].get("status") == "ok"
         ]
-        total_values = sum(row["numel"] for row in rows)
-        total_error = sum(row["sum_abs_error"] for row in rows)
-        comparison_summary[key] = {
-            "left": left_name,
-            "right": right_name,
-            "completed_cases": len(rows),
-            "unavailable_cases": sum(
-                1
-                for case in cases
-                for comparison in case.get("numerical_comparisons", [])
-                if comparison["left"] == left_name
-                and comparison["right"] == right_name
-                and comparison["status"] != "ok"
-            ),
-            "maximum_abs_error": (
-                max(row["max_abs_error"] for row in rows) if rows else None
-            ),
-            "weighted_mean_abs_error": (
-                total_error / total_values if total_values else None
-            ),
-            "compared_values": total_values,
+        failures = [
+            replay["paths"][path_name]
+            for replay in stability_replays
+            if path_name in replay.get("paths", {})
+            and replay["paths"][path_name].get("status") == "error"
+        ]
+        medians = [row["latency"]["median_ms"] for row in rows]
+        speedups = [
+            row["speedup_vs_legacy"]
+            for row in rows
+            if row.get("speedup_vs_legacy") is not None
+        ]
+        stability_path_summary[path_name] = {
+            "completed_steps": len(rows),
+            "runtime_failures": len(failures),
+            "median_replay_ms": statistics.median(medians) if medians else None,
+            "p95_replay_ms": percentile(medians, 0.95) if medians else None,
+            "geometric_mean_speedup_vs_legacy": geometric_mean(speedups),
+            "minimum_speedup_vs_legacy": min(speedups) if speedups else None,
+            "maximum_speedup_vs_legacy": max(speedups) if speedups else None,
         }
 
     return {
@@ -354,7 +565,36 @@ def build_summary(cases: list[dict[str, Any]]) -> dict[str, Any]:
             for result in case.get("paths", {}).values()
         ),
         "paths": path_summary,
-        "numerical_comparisons": comparison_summary,
+        "numerical_comparisons": summarize_numerical(cases),
+        "stability": {
+            "total_steps": len(stability_replays),
+            "completed_steps": sum(
+                replay.get("status") == "completed" for replay in stability_replays
+            ),
+            "failed_steps": sum(
+                replay.get("status") == "error" for replay in stability_replays
+            ),
+            "paths": stability_path_summary,
+            "numerical_comparisons": summarize_numerical(
+                stability_replays,
+                STABILITY_NUMERICAL_COMPARISONS,
+            ),
+            "reduce_overhead_vs_buckets": summarize_reduce_vs_buckets(
+                stability_replays
+            ),
+            "by_padding_profile": {
+                profile: summarize_reduce_vs_buckets([
+                    replay
+                    for replay in stability_replays
+                    if replay.get("padding_profile") == profile
+                ])
+                for profile in PADDING_PROFILES
+                if any(
+                    replay.get("padding_profile") == profile
+                    for replay in stability_replays
+                )
+            },
+        },
     }
 
 
@@ -363,19 +603,212 @@ def write_report(
     metadata: dict[str, Any],
     cases: list[dict[str, Any]],
     status: str,
+    stability_replays: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    stability_replays = stability_replays or []
     report = {
         "status": status,
         "updated_at": utc_now(),
         "metadata": metadata,
         "cases": cases,
-        "summary": build_summary(cases),
+        "stability_replays": stability_replays,
+        "summary": build_summary(cases, stability_replays),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
     temporary.write_text(json.dumps(report, indent=2) + "\n")
     os.replace(temporary, output)
     return report
+
+
+def run_stability_phase(
+    execution_paths,
+    args: argparse.Namespace,
+    device: torch.device,
+    vocab_size: int,
+    pad_token_id: int,
+    max_positions: int,
+    metadata: dict[str, Any],
+    cases: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if args.stability_cycles == 0:
+        return []
+
+    selected_paths = {
+        name: (path_encoder, compile_mode, dynamic, setup_error)
+        for name, path_encoder, compile_mode, dynamic, setup_error in execution_paths
+        if name in STABILITY_PATH_NAMES
+    }
+    valid_shapes = [
+        shape
+        for shape in args.shapes
+        if not max_positions or shape[1] <= max_positions
+    ]
+    stability_replays = []
+    total_steps = args.stability_cycles * len(valid_shapes)
+    previous_shape = None
+    step_number = 0
+    print(
+        "\nPOST-PRECOMPILE STABILITY REPLAY\n"
+        "  comparing legacy, reduce-overhead, and max-autotune-buckets\n"
+        "  all static buckets have already been compiled by the main sweep",
+        flush=True,
+    )
+
+    with torch.inference_mode():
+        for cycle_index in range(args.stability_cycles):
+            padding_profile = args.stability_padding_profiles[
+                cycle_index % len(args.stability_padding_profiles)
+            ]
+            order = stability_order(valid_shapes, cycle_index)
+            print(
+                f"\nSTABILITY CYCLE {cycle_index + 1}/{args.stability_cycles} "
+                f"padding={padding_profile}",
+                flush=True,
+            )
+            for cycle_step, (batch, length) in enumerate(order, start=1):
+                step_number += 1
+                shape_name = f"b{batch}_l{length}"
+                print(
+                    f"\n[stability {step_number}/{total_steps}] {shape_name} "
+                    f"after={previous_shape or 'main-sweep'} padding={padding_profile}",
+                    flush=True,
+                )
+                replay = {
+                    "replay_id": f"cycle{cycle_index + 1}_step{cycle_step}_{shape_name}",
+                    "cycle": cycle_index + 1,
+                    "cycle_step": cycle_step,
+                    "batch_size": batch,
+                    "sequence_length": length,
+                    "previous_shape": previous_shape,
+                    "padding_profile": padding_profile,
+                    "status": "running",
+                    "paths": {},
+                    "numerical_comparisons": [],
+                }
+                try:
+                    input_ids, attention_mask, valid_lengths = make_inputs(
+                        batch,
+                        length,
+                        vocab_size,
+                        pad_token_id,
+                        padding_profile,
+                        device,
+                        variant=cycle_index * 10_000 + cycle_step,
+                    )
+                except Exception as exc:
+                    replay["status"] = "error"
+                    replay["input_error"] = {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                    stability_replays.append(replay)
+                    write_report(
+                        args.output,
+                        metadata,
+                        cases,
+                        "running",
+                        stability_replays,
+                    )
+                    print(f"  INPUT ERROR: {type(exc).__name__}: {exc}", flush=True)
+                    previous_shape = shape_name
+                    continue
+
+                valid_tokens = int(sum(valid_lengths))
+                replay["valid_lengths"] = valid_lengths
+                replay["valid_tokens"] = valid_tokens
+                replay["padding_ratio"] = 1.0 - valid_tokens / (batch * length)
+                print(f"  valid_lengths={valid_lengths}", flush=True)
+
+                outputs = {}
+                legacy_ms = None
+                for path_name in STABILITY_PATH_NAMES:
+                    path_encoder, compile_mode, dynamic, setup_error = selected_paths[
+                        path_name
+                    ]
+                    result = {
+                        "status": "running",
+                        "compile_mode": compile_mode or "eager",
+                        "dynamic": dynamic,
+                    }
+                    replay["paths"][path_name] = result
+                    if setup_error is not None or path_encoder is None:
+                        result["status"] = "error"
+                        result["error"] = setup_error or {
+                            "type": "RuntimeError",
+                            "message": "execution path was not created",
+                        }
+                        print(f"  ERROR {path_name}: path setup failed", flush=True)
+                        continue
+                    try:
+                        latency, path_output = median_latency(
+                            path_encoder,
+                            input_ids,
+                            attention_mask,
+                            warmup=0,
+                            runs=args.stability_runs,
+                            label=f"stability {path_name}",
+                        )
+                        path_output = path_output.detach().clone()
+                        outputs[path_name] = path_output
+                        del path_output
+                        path_ms = latency["median_ms"]
+                        if path_name == "legacy":
+                            legacy_ms = path_ms
+                        speedup = (
+                            legacy_ms / path_ms if legacy_ms is not None else None
+                        )
+                        result.update({
+                            "status": "ok",
+                            "latency": latency,
+                            "runs": args.stability_runs,
+                            "speedup_vs_legacy": speedup,
+                            "documents_per_second": batch * 1_000.0 / path_ms,
+                            "valid_tokens_per_second": valid_tokens * 1_000.0 / path_ms,
+                        })
+                        speedup_text = (
+                            f" vs_legacy={speedup:.3f}x"
+                            if speedup is not None
+                            else ""
+                        )
+                        print(
+                            f"  REPLAY {path_name}: median={path_ms:.3f} ms"
+                            f"{speedup_text}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        result["status"] = "error"
+                        result["error"] = {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                        print(
+                            f"  ERROR {path_name}: {type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+
+                print("  numerical differences:", flush=True)
+                replay["numerical_comparisons"] = compare_outputs(
+                    outputs,
+                    indent="    ",
+                    comparison_pairs=STABILITY_NUMERICAL_COMPARISONS,
+                )
+                del outputs
+                del input_ids, attention_mask
+                replay["status"] = "completed"
+                stability_replays.append(replay)
+                write_report(
+                    args.output,
+                    metadata,
+                    cases,
+                    "running",
+                    stability_replays,
+                )
+                previous_shape = shape_name
+
+    return stability_replays
 
 
 def format_number(value: Any, digits: int = 3) -> str:
@@ -487,12 +920,84 @@ def print_final_tables(cases: list[dict[str, Any]], summary: dict[str, Any]) -> 
         numerical_rows,
     )
 
+    stability = summary.get("stability", {})
+    if stability.get("total_steps", 0):
+        print("\nPOST-PRECOMPILE STABILITY SUMMARY", flush=True)
+        stability_rows = []
+        for path_name in STABILITY_PATH_NAMES:
+            row = stability["paths"][path_name]
+            stability_rows.append([
+                path_name,
+                str(row["completed_steps"]),
+                str(row["runtime_failures"]),
+                format_number(row["median_replay_ms"]),
+                format_number(row["p95_replay_ms"]),
+                format_number(row["geometric_mean_speedup_vs_legacy"]),
+                format_number(row["minimum_speedup_vs_legacy"]),
+            ])
+        print_table(
+            [
+                "path", "steps", "errors", "median_ms", "p95_ms",
+                "geo_x_legacy", "min_x_legacy",
+            ],
+            stability_rows,
+        )
+
+        print("\nPOST-PRECOMPILE NUMERICAL SUMMARY", flush=True)
+        replay_numerical_rows = []
+        for comparison in stability["numerical_comparisons"].values():
+            replay_numerical_rows.append([
+                f"{comparison['left']} vs {comparison['right']}",
+                str(comparison["completed_cases"]),
+                str(comparison["unavailable_cases"]),
+                format_number(comparison["maximum_abs_error"], 7),
+                format_number(comparison["weighted_mean_abs_error"], 9),
+            ])
+        print_table(
+            ["comparison", "steps", "missing", "max_abs", "weighted_mean_abs"],
+            replay_numerical_rows,
+        )
+
+        print("\nREDUCE-OVERHEAD VS PRECOMPILED BUCKETS", flush=True)
+        decision_rows = []
+        decision_groups = [
+            ("all", stability["reduce_overhead_vs_buckets"]),
+            *stability["by_padding_profile"].items(),
+        ]
+        for profile, row in decision_groups:
+            decision_rows.append([
+                profile,
+                str(row["comparable_steps"]),
+                str(row["unavailable_steps"]),
+                str(row["bucket_wins"]),
+                str(row["reduce_overhead_wins"]),
+                format_number(
+                    row["geometric_mean_bucket_speedup_vs_reduce_overhead"]
+                ),
+                format_number(row["minimum_bucket_speedup_vs_reduce_overhead"]),
+                format_number(row["maximum_bucket_speedup_vs_reduce_overhead"]),
+                format_number(
+                    row["maximum_abs_error_bucket_vs_reduce_overhead"], 7
+                ),
+                format_number(
+                    row["weighted_mean_abs_error_bucket_vs_reduce_overhead"], 9
+                ),
+            ])
+        print_table(
+            [
+                "padding", "steps", "missing", "bucket_wins", "reduce_wins",
+                "geo_bucket_x", "min_bucket_x", "max_bucket_x", "max_abs",
+                "mean_abs",
+            ],
+            decision_rows,
+        )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         description=(
-            "Compare five eager/compiled GLiNER2 encoder paths across CUDA "
+            "Compare four eager/compiled GLiNER2 encoder paths across CUDA "
             "shapes and save detailed plus aggregate results."
         ),
     )
@@ -504,9 +1009,27 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_SHAPES),
         help="comma-separated batch-by-sequence shapes, for example 1x64,8x476",
     )
-    parser.add_argument("--padding", choices=("none", "mixed"), default="mixed")
+    parser.add_argument("--padding", choices=PADDING_PROFILES, default="mixed")
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
+    parser.add_argument(
+        "--stability-padding-profiles",
+        type=parse_padding_profiles,
+        default=list(PADDING_PROFILES),
+        help="valid-token mask profiles replayed after every bucket is compiled",
+    )
+    parser.add_argument(
+        "--stability-cycles",
+        type=int,
+        default=len(PADDING_PROFILES),
+        help="post-precompile bucket-transition cycles; zero disables the phase",
+    )
+    parser.add_argument(
+        "--stability-runs",
+        type=int,
+        default=DEFAULT_STABILITY_RUNS,
+        help="calls per path after each bucket transition",
+    )
     parser.add_argument(
         "--fullgraph",
         action="store_true",
@@ -523,6 +1046,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--warmup must be non-negative")
     if args.runs <= 0:
         parser.error("--runs must be positive")
+    if args.stability_cycles < 0:
+        parser.error("--stability-cycles must be non-negative")
+    if args.stability_runs <= 0:
+        parser.error("--stability-runs must be positive")
     return args
 
 
@@ -624,6 +1151,16 @@ def main() -> int:
         "warmup": args.warmup,
         "iterations": args.runs,
         "fullgraph": args.fullgraph,
+        "stability": {
+            "cycles": args.stability_cycles,
+            "runs_per_transition": args.stability_runs,
+            "padding_profiles": args.stability_padding_profiles,
+            "paths": list(STABILITY_PATH_NAMES),
+            "numerical_comparisons": [
+                {"left": left, "right": right}
+                for left, right in STABILITY_NUMERICAL_COMPARISONS
+            ],
+        },
         "requested_shapes": [
             {"batch_size": batch, "sequence_length": length}
             for batch, length in args.shapes
@@ -813,59 +1350,7 @@ def main() -> int:
                     print(traceback.format_exc(), flush=True)
 
             print("\n  --- numerical differences ---", flush=True)
-            for left_name, right_name in NUMERICAL_COMPARISONS:
-                if left_name not in outputs or right_name not in outputs:
-                    comparison = {
-                        "left": left_name,
-                        "right": right_name,
-                        "status": "unavailable",
-                    }
-                    case_record["numerical_comparisons"].append(comparison)
-                    print(
-                        f"  {left_name} vs {right_name}: unavailable because a path failed",
-                        flush=True,
-                    )
-                    continue
-                try:
-                    difference = (
-                        outputs[left_name].float() - outputs[right_name].float()
-                    ).abs()
-                    max_error = float(difference.max().item())
-                    mean_error = float(difference.mean().item())
-                    sum_error = float(difference.sum().item())
-                    comparison = {
-                        "left": left_name,
-                        "right": right_name,
-                        "status": "ok",
-                        "max_abs_error": max_error,
-                        "mean_abs_error": mean_error,
-                        "sum_abs_error": sum_error,
-                        "numel": difference.numel(),
-                    }
-                    case_record["numerical_comparisons"].append(comparison)
-                    print(
-                        f"  {left_name} vs {right_name}: "
-                        f"max_abs={max_error:.6g} | mean_abs={mean_error:.6g}",
-                        flush=True,
-                    )
-                    del difference
-                except Exception as exc:
-                    comparison = {
-                        "left": left_name,
-                        "right": right_name,
-                        "status": "error",
-                        "error": {
-                            "type": type(exc).__name__,
-                            "message": str(exc),
-                            "traceback": traceback.format_exc(),
-                        },
-                    }
-                    case_record["numerical_comparisons"].append(comparison)
-                    print(
-                        f"  ERROR comparing {left_name} vs {right_name}: "
-                        f"{type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
+            case_record["numerical_comparisons"] = compare_outputs(outputs)
 
             del outputs
             del input_ids, attention_mask
@@ -877,23 +1362,47 @@ def main() -> int:
                 flush=True,
             )
 
+    stability_replays = run_stability_phase(
+        execution_paths,
+        args,
+        device,
+        vocab_size,
+        pad_token_id,
+        max_positions,
+        metadata,
+        cases,
+    )
+
     runtime_failures = sum(
         result.get("status") == "error"
         for case_record in cases
         for result in case_record.get("paths", {}).values()
+    ) + sum(
+        result.get("status") == "error"
+        for replay in stability_replays
+        for result in replay.get("paths", {}).values()
     )
     input_failures = sum(case_record.get("status") == "error" for case_record in cases)
+    input_failures += sum(
+        replay.get("status") == "error" for replay in stability_replays
+    )
     metadata["completed_at"] = utc_now()
     final_status = (
         "completed_with_errors" if runtime_failures or input_failures else "completed"
     )
-    report = write_report(args.output, metadata, cases, final_status)
-    print_final_tables(cases, report["summary"])
+    report = write_report(
+        args.output,
+        metadata,
+        cases,
+        final_status,
+        stability_replays,
+    )
     print(
-        f"\nJSON saved to {args.output.resolve()} | "
+        f"\nResults saved to {args.output.resolve()} | "
         f"runtime_failures={runtime_failures} input_failures={input_failures}",
         flush=True,
     )
+    print_final_tables(cases, report["summary"])
     return 1 if runtime_failures or input_failures else 0
 
 
