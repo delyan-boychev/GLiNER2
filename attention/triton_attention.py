@@ -7,6 +7,7 @@ P2C remain regular GEMMs over the pruned active relative-position slots.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any, NamedTuple
 
 import torch
@@ -32,6 +33,33 @@ if triton is not None:
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
     ]
+
+    def _prune_autotune_configs(
+        configs: list[Any],
+        named_args: dict[str, Any],
+        **kwargs: Any,
+    ) -> list[Any]:
+        """Avoid compiling obviously wasteful or register-heavy candidates."""
+
+        sequence_length_value = kwargs.get(
+            "SEQUENCE_LENGTH",
+            named_args.get("SEQUENCE_LENGTH"),
+        )
+        head_dim_value = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
+        if sequence_length_value is None or head_dim_value is None:
+            return configs
+        sequence_length = int(sequence_length_value)
+        head_dim = int(head_dim_value)
+        maximum_m = max(16, sequence_length)
+        maximum_n = max(32, sequence_length)
+        kept = [
+            config
+            for config in configs
+            if config.kwargs["BLOCK_M"] <= maximum_m
+            and config.kwargs["BLOCK_N"] <= maximum_n
+            and not (head_dim == 128 and config.kwargs["BLOCK_M"] == 128)
+        ]
+        return kept or configs[:1]
 
     @triton.jit
     def _deberta_attention_forward_kernel(
@@ -209,9 +237,15 @@ if triton is not None:
         )
 
 
+    _autotune_kwargs: dict[str, Any] = {
+        "configs": _AUTOTUNE_CONFIGS,
+        "key": ["SEQUENCE_LENGTH", "HEAD_DIM", "IS_FP32", "STRICT_FP32"],
+        "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
+    }
+    if "cache_results" in inspect.signature(triton.autotune).parameters:
+        _autotune_kwargs["cache_results"] = True
     _deberta_attention_autotuned_kernel = triton.autotune(
-        configs=_AUTOTUNE_CONFIGS,
-        key=["SEQUENCE_LENGTH", "HEAD_DIM", "IS_FP32", "STRICT_FP32"],
+        **_autotune_kwargs
     )(_deberta_attention_forward_kernel)
 
 

@@ -1,4 +1,4 @@
-"""Isolated CUDA benchmark for the standalone DeBERTa attention backends.
+"""Isolated CUDA benchmark for standalone DeBERTa attention/encoder backends.
 
 By default this benchmarks the reference, prepared PyTorch, and Triton
 implementations under the four requested execution configurations:
@@ -406,6 +406,10 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             "hidden_size must equal num_attention_heads * attention_head_size"
         )
+    if args.implementation == "triton" and args.triton_autotune:
+        # Triton documents this switch as the supported way to report tuning
+        # time and the winning configuration for every new tuning key.
+        os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 
     configure_fp32(args.fp32_precision)
     torch.manual_seed(args.seed)

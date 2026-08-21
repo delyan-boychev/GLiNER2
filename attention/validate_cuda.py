@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Callable
 
@@ -189,6 +190,8 @@ def main() -> None:
         raise ValueError("head dimensions must be selected from 32, 64, and 128")
 
     configure_fp32(args.fp32_precision)
+    if "triton" in args.backends and args.triton_autotune:
+        os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
     rows = []
     for dtype_name in args.dtypes:
         for head_dim in args.head_dims:
