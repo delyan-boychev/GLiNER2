@@ -148,7 +148,7 @@ if triton is not None:
         delta_to_local_slot,
         attention_mask,
         output,
-        active_slots,
+        ACTIVE_SLOTS: tl.constexpr,
         NUM_HEADS: tl.constexpr,
         SEQUENCE_LENGTH: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -234,23 +234,23 @@ if triton is not None:
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
                 other=0,
-            )
+            ).to(tl.int32)
 
             if HAS_C2P:
-                c2p_base = c2p + batch_head * SEQUENCE_LENGTH * active_slots
+                c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
                 scores += tl.load(
                     c2p_base
-                    + query_offsets[:, None] * active_slots
+                    + query_offsets[:, None] * ACTIVE_SLOTS
                     + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
 
             if HAS_P2C:
-                p2c_base = p2c + batch_head * SEQUENCE_LENGTH * active_slots
+                p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
                 scores += tl.load(
                     p2c_base
-                    + key_offsets[None, :] * active_slots
+                    + key_offsets[None, :] * ACTIVE_SLOTS
                     + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
@@ -359,6 +359,7 @@ if triton is not None:
             )
 
         kernel_kwargs = {
+            "ACTIVE_SLOTS": active_slots,
             "NUM_HEADS": num_heads,
             "SEQUENCE_LENGTH": sequence_length,
             "HEAD_DIM": query.size(-1),
@@ -378,7 +379,6 @@ if triton is not None:
             delta_to_local,
             attention_mask,
             output,
-            active_slots,
             **kernel_kwargs,
         )
         return output
@@ -482,7 +482,7 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
         plan = TritonPreparedPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
-            delta_to_local=indices.delta_to_local,
+            delta_to_local=indices.delta_to_local.to(dtype=torch.int32).contiguous(),
             pos_key=pos_key,
             pos_query=pos_query,
         )
