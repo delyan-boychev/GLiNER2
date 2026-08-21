@@ -52,7 +52,6 @@ class DebertaV2InferenceEncoder(nn.Module):
         backend: str = "triton",
         fuse_qkv: bool = False,
         fp32_precision: str = "strict",
-        triton_autotune: bool = True,
     ) -> None:
         super().__init__()
         if backend not in {"optimized", "triton"}:
@@ -111,7 +110,6 @@ class DebertaV2InferenceEncoder(nn.Module):
             }
             if backend == "triton":
                 kwargs["fp32_precision"] = fp32_precision
-                kwargs["autotune"] = triton_autotune
             replacement = attention_class(config, **kwargs)
             replacement.load_state_dict(original_attention.state_dict(), strict=True)
             replacement.to(
@@ -323,7 +321,6 @@ def enable_deberta_v2_inference(
     sequence_lengths: Iterable[int] | int | None = None,
     fuse_qkv: bool = False,
     fp32_precision: str = "strict",
-    triton_autotune: bool = True,
 ) -> nn.Module:
     """Replace a HF DeBERTa-v2/v3 encoder without changing checkpoint keys.
 
@@ -348,7 +345,6 @@ def enable_deberta_v2_inference(
         backend=backend,
         fuse_qkv=fuse_qkv,
         fp32_precision=fp32_precision,
-        triton_autotune=triton_autotune,
     )
     model.train(was_training)
     if sequence_lengths is not None:

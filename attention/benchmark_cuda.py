@@ -197,7 +197,6 @@ def make_models(
     attention_head_size: int,
     fuse_qkv: bool,
     fp32_precision: str,
-    triton_autotune: bool,
     sequence_lengths: list[int],
     num_hidden_layers: int,
     intermediate_size: int,
@@ -241,14 +240,12 @@ def make_models(
                 backend=implementation,
                 fuse_qkv=fuse_qkv,
                 fp32_precision=fp32_precision,
-                triton_autotune=triton_autotune,
             )
     elif implementation == "triton":
         target = TritonInferenceDisentangledSelfAttention(
             config,
             fuse_qkv=fuse_qkv,
             fp32_precision=fp32_precision,
-            autotune=triton_autotune,
         )
         target.load_state_dict(reference.state_dict(), strict=True)
     elif implementation == "optimized":
@@ -406,7 +403,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(
             "hidden_size must equal num_attention_heads * attention_head_size"
         )
-    if args.implementation == "triton" and args.triton_autotune:
+    if args.implementation == "triton":
         # Triton documents this switch as the supported way to report tuning
         # time and the winning configuration for every new tuning key.
         os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
@@ -427,7 +424,6 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         args.attention_head_size,
         args.fuse_qkv,
         args.fp32_precision,
-        args.triton_autotune,
         args.lengths,
         args.num_hidden_layers,
         args.intermediate_size,
@@ -455,7 +451,6 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         "attention_head_size": args.attention_head_size,
         "fuse_qkv": args.fuse_qkv,
         "fp32_precision": args.fp32_precision,
-        "triton_autotune": args.triton_autotune,
         "num_hidden_layers": args.num_hidden_layers,
         "intermediate_size": args.intermediate_size,
         "conv_kernel_size": args.conv_kernel_size,
@@ -719,11 +714,6 @@ def run_parent(args: argparse.Namespace) -> None:
                         str(args.conv_kernel_size),
                     ]
                     command.append("--fuse-qkv" if args.fuse_qkv else "--no-fuse-qkv")
-                    command.append(
-                        "--triton-autotune"
-                        if args.triton_autotune
-                        else "--no-triton-autotune"
-                    )
                     command.append("--fullgraph" if args.fullgraph else "--no-fullgraph")
                     command.append("--dynamic" if args.dynamic else "--static")
                     print()
@@ -763,7 +753,6 @@ def run_parent(args: argparse.Namespace) -> None:
             "attention_head_size": args.attention_head_size,
             "fuse_qkv": args.fuse_qkv,
             "fp32_precision": args.fp32_precision,
-            "triton_autotune": args.triton_autotune,
             "num_hidden_layers": args.num_hidden_layers,
             "intermediate_size": args.intermediate_size,
             "conv_kernel_size": args.conv_kernel_size,
@@ -816,11 +805,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--fuse-qkv",
         action=argparse.BooleanOptionalAction,
         default=False,
-    )
-    parser.add_argument(
-        "--triton-autotune",
-        action=argparse.BooleanOptionalAction,
-        default=True,
     )
     parser.add_argument("--vocab-size", type=int, default=8192)
     parser.add_argument("--minimum-length-fraction", type=float, default=0.60)
