@@ -80,8 +80,9 @@ def parse_args() -> argparse.Namespace:
         choices=("strict", "fast"),
         default="strict",
     )
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--iterations", type=int, default=500)
     return parser.parse_args()
 
 
@@ -217,14 +218,22 @@ def main() -> None:
     print(f"dtype:      {dtype}")
     print(f"gpu:        {torch.cuda.get_device_name(device)}")
     print(f"bucket:     {args.bucket}")
+    print(f"batch size: {args.batch_size}")
     print(f"warmup:     {args.warmup}")
     print(f"iterations: {args.iterations}")
     print()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    premises = [premise for premise, _, _ in EXAMPLES]
-    hypotheses = [hypothesis for _, hypothesis, _ in EXAMPLES]
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+
+    selected_examples = [
+        EXAMPLES[index % len(EXAMPLES)]
+        for index in range(args.batch_size)
+    ]
+    premises = [premise for premise, _, _ in selected_examples]
+    hypotheses = [hypothesis for _, hypothesis, _ in selected_examples]
 
     encoded = tokenizer(
         premises,
@@ -312,7 +321,7 @@ def main() -> None:
 
     all_predictions_match = True
 
-    for index, (premise, hypothesis, expected) in enumerate(EXAMPLES):
+    for index, (premise, hypothesis, expected) in enumerate(selected_examples):
         ref_id = int(reference_prediction[index])
         cand_id = int(candidate_prediction[index])
 
