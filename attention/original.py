@@ -542,7 +542,16 @@ class ConvLayer(nn.Module):
         output = self.conv(hidden_states.permute(0, 2, 1).contiguous())
         output = output.permute(0, 2, 1).contiguous()
         if input_mask is not None:
-            remove_mask = (1 - input_mask).bool()
+            # The upstream implementation uses ``1 - input_mask``, which is
+            # valid for tokenizer-produced integer masks but raises for bool
+            # masks.  Encoder benchmarks and callers may legitimately provide
+            # bool padding masks, so use the equivalent logical operation for
+            # that dtype while retaining upstream behavior for numeric masks.
+            remove_mask = (
+                ~input_mask
+                if input_mask.dtype == torch.bool
+                else (1 - input_mask).bool()
+            )
             output.masked_fill_(remove_mask.unsqueeze(-1).expand(output.size()), 0)
         output = ACT2FN[self.conv_act](self.dropout(output))
 
