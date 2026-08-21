@@ -38,41 +38,22 @@ if triton is not None:
     # Larger/deeper schedules can be reintroduced later as architecture-specific
     # opt-in candidates after profiling their actual register/SMEM usage.
     _AUTOTUNE_CONFIGS = [
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 16},
-            num_warps=2,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_M": 16, "BLOCK_N": 32},
-            num_warps=2,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 32},
-            num_warps=2,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 32},
-            num_warps=4,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_M": 32, "BLOCK_N": 64},
-            num_warps=4,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 32},
-            num_warps=4,
-            num_stages=1,
-        ),
-        triton.Config(
-            {"BLOCK_M": 64, "BLOCK_N": 64},
-            num_warps=4,
-            num_stages=1,
-        ),
+        # tiny
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=1),
+
+        # short / medium
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+
+        # normal long path
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+
+        # aggressive, but still sane
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
     ]
 
     def _prune_autotune_configs(
