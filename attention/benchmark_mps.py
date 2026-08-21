@@ -10,7 +10,11 @@ import time
 import torch
 
 from .optimized import InferenceDisentangledSelfAttention
-from .original import DebertaAttentionConfig, OriginalDisentangledSelfAttention
+from .original import (
+    DebertaAttentionConfig,
+    OriginalDisentangledSelfAttention,
+    _prepare_attention_mask,
+)
 
 
 def synchronize() -> None:
@@ -132,7 +136,7 @@ def main() -> None:
 
                 reference_output = reference(
                     hidden_states,
-                    attention_mask,
+                    _prepare_attention_mask(attention_mask, length, length),
                     rel_embeddings=rel_embeddings,
                 )[0]
                 prepared_plan = optimized.prepare_shape(length, device)
@@ -149,7 +153,7 @@ def main() -> None:
 
                 reference_call = lambda: reference(
                     hidden_states,
-                    attention_mask,
+                    _prepare_attention_mask(attention_mask, length, length),
                     rel_embeddings=rel_embeddings,
                 )
                 optimized_call = lambda: optimized.forward_prepared(

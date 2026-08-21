@@ -29,8 +29,14 @@ from typing import Any, Callable
 
 import torch
 
+from .encoder import DebertaV2InferenceEncoder
 from .optimized import InferenceDisentangledSelfAttention
-from .original import DebertaAttentionConfig, OriginalDisentangledSelfAttention
+from .original import (
+    DebertaAttentionConfig,
+    DebertaV2Encoder,
+    OriginalDisentangledSelfAttention,
+    _prepare_attention_mask,
+)
 from .triton_attention import TritonInferenceDisentangledSelfAttention
 
 
@@ -41,6 +47,7 @@ IMPLEMENTATIONS = {
 }
 DTYPES = {
     "fp16": torch.float16,
+    "bf16": torch.bfloat16,
     "fp32": torch.float32,
 }
 
@@ -64,22 +71,31 @@ def percentile(values: list[float], quantile: float) -> float:
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
-def configure_fp32() -> None:
-    torch.set_float32_matmul_precision("highest")
+def configure_fp32(precision: str) -> None:
+    torch.set_float32_matmul_precision("highest" if precision == "strict" else "high")
     try:
-        torch.backends.cuda.matmul.fp32_precision = "ieee"
+        torch.backends.cuda.matmul.fp32_precision = (
+            "ieee" if precision == "strict" else "tf32"
+        )
     except (AttributeError, RuntimeError):
-        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = precision == "fast"
 
 
 def initialize_parameters(module: torch.nn.Module, seed: int) -> None:
     generator = torch.Generator(device="cpu").manual_seed(seed)
     with torch.no_grad():
-        for parameter in module.parameters():
-            if parameter.ndim > 1:
-                parameter.normal_(mean=0.0, std=0.02, generator=generator)
-            else:
-                parameter.zero_()
+        for child in module.modules():
+            if isinstance(child, (torch.nn.Linear, torch.nn.Conv1d)):
+                child.weight.normal_(mean=0.0, std=0.02, generator=generator)
+                if child.bias is not None:
+                    child.bias.zero_()
+            elif isinstance(child, torch.nn.Embedding):
+                child.weight.normal_(mean=0.0, std=0.02, generator=generator)
+            elif isinstance(child, torch.nn.LayerNorm):
+                if child.weight is not None:
+                    child.weight.fill_(1.0)
+                if child.bias is not None:
+                    child.bias.zero_()
 
 
 def make_embedding_table(
@@ -134,19 +150,32 @@ def make_inputs(
 
 
 def make_models(
+    scope: str,
     implementation: str,
     dtype: torch.dtype,
     device: torch.device,
     seed: int,
+    hidden_size: int,
+    num_attention_heads: int,
+    attention_head_size: int,
+    fuse_qkv: bool,
+    fp32_precision: str,
+    sequence_lengths: list[int],
+    num_hidden_layers: int,
+    intermediate_size: int,
+    conv_kernel_size: int,
 ) -> tuple[
-    OriginalDisentangledSelfAttention,
     torch.nn.Module,
-    torch.Tensor,
+    torch.nn.Module,
+    torch.Tensor | None,
     float,
 ]:
     config = DebertaAttentionConfig(
-        hidden_size=768,
-        num_attention_heads=12,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        attention_head_size=attention_head_size,
+        num_hidden_layers=num_hidden_layers,
+        intermediate_size=intermediate_size,
         attention_probs_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
         relative_attention=True,
@@ -154,48 +183,97 @@ def make_models(
         max_position_embeddings=512,
         position_buckets=256,
         share_att_key=True,
-        pos_att_type="p2c|c2p",
+        pos_att_type=("p2c", "c2p"),
+        conv_kernel_size=conv_kernel_size,
     )
-    reference = OriginalDisentangledSelfAttention(config)
+    if scope == "encoder":
+        reference = DebertaV2Encoder(config)
+    else:
+        reference = OriginalDisentangledSelfAttention(config)
     initialize_parameters(reference, seed)
-    target = IMPLEMENTATIONS[implementation](config)
-    target.load_state_dict(reference.state_dict(), strict=True)
+    if scope == "encoder":
+        source = DebertaV2Encoder(config)
+        source.load_state_dict(reference.state_dict(), strict=True)
+        if implementation == "original":
+            target = source
+        else:
+            target = DebertaV2InferenceEncoder(
+                source,
+                config,
+                backend=implementation,
+                fuse_qkv=fuse_qkv,
+                fp32_precision=fp32_precision,
+            )
+    elif implementation == "triton":
+        target = TritonInferenceDisentangledSelfAttention(
+            config, fuse_qkv=fuse_qkv, fp32_precision=fp32_precision
+        )
+        target.load_state_dict(reference.state_dict(), strict=True)
+    elif implementation == "optimized":
+        target = InferenceDisentangledSelfAttention(config, fuse_qkv=fuse_qkv)
+        target.load_state_dict(reference.state_dict(), strict=True)
+    else:
+        target = OriginalDisentangledSelfAttention(config)
+        target.load_state_dict(reference.state_dict(), strict=True)
     reference = reference.to(device=device, dtype=dtype).eval()
     target = target.to(device=device, dtype=dtype).eval()
 
-    generator = torch.Generator(device="cpu").manual_seed(seed + 1)
-    rel_embeddings = torch.empty(
-        config.position_buckets * 2,
-        config.hidden_size,
-        dtype=torch.float32,
-        device="cpu",
-    )
-    rel_embeddings.normal_(mean=0.0, std=0.02, generator=generator)
-    rel_embeddings = rel_embeddings.to(device=device, dtype=dtype)
+    rel_embeddings = None
+    if scope == "attention":
+        generator = torch.Generator(device="cpu").manual_seed(seed + 1)
+        rel_embeddings = torch.empty(
+            config.position_buckets * 2,
+            config.hidden_size,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        rel_embeddings.normal_(mean=0.0, std=0.02, generator=generator)
+        rel_embeddings = rel_embeddings.to(device=device, dtype=dtype)
 
     preparation_ms = 0.0
     if implementation != "original":
         torch.cuda.synchronize()
         started = time.perf_counter()
-        target.prepare_for_inference(rel_embeddings)
+        if scope == "encoder":
+            target.prepare_for_inference(sequence_lengths, fuse_qkv=fuse_qkv)
+        else:
+            target.prepare_for_inference(rel_embeddings)
         torch.cuda.synchronize()
         preparation_ms = (time.perf_counter() - started) * 1000.0
     return reference, target, rel_embeddings, preparation_ms
 
 
 def make_callable(
+    scope: str,
     implementation: str,
     target: torch.nn.Module,
-    rel_embeddings: torch.Tensor,
+    rel_embeddings: torch.Tensor | None,
     sequence_length: int,
     device: torch.device,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    if implementation == "original":
+    if scope == "encoder":
+        if implementation != "original":
+            target.activate_shape(sequence_length)
 
         def call(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
             return target(
                 hidden_states,
                 attention_mask,
+                output_hidden_states=False,
+            ).last_hidden_state
+
+        return call
+
+    if implementation == "original":
+
+        def call(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+            return target(
+                hidden_states,
+                _prepare_attention_mask(
+                    attention_mask,
+                    hidden_states.size(1),
+                    hidden_states.size(1),
+                ),
                 rel_embeddings=rel_embeddings,
             )[0]
 
@@ -241,20 +319,32 @@ def measure_calls(
 
 
 def compare_outputs(
-    reference: OriginalDisentangledSelfAttention,
+    scope: str,
+    reference: torch.nn.Module,
     target_call: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-    rel_embeddings: torch.Tensor,
+    rel_embeddings: torch.Tensor | None,
     batches: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> tuple[float, float]:
     maximum = 0.0
     absolute_sum = 0.0
     element_count = 0
     for hidden_states, attention_mask in batches:
-        reference_output = reference(
-            hidden_states,
-            attention_mask,
-            rel_embeddings=rel_embeddings,
-        )[0]
+        if scope == "encoder":
+            reference_output = reference(
+                hidden_states,
+                attention_mask,
+                output_hidden_states=False,
+            ).last_hidden_state
+        else:
+            reference_output = reference(
+                hidden_states,
+                _prepare_attention_mask(
+                    attention_mask,
+                    hidden_states.size(1),
+                    hidden_states.size(1),
+                ),
+                rel_embeddings=rel_embeddings,
+            )[0]
         target_output = target_call(hidden_states, attention_mask)
         difference = (reference_output.float() - target_output.float()).abs()
         maximum = max(maximum, difference.max().item())
@@ -270,21 +360,35 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown implementation: {args.implementation}")
     if args.dtype not in DTYPES:
         raise ValueError(f"unknown dtype: {args.dtype}")
+    if args.hidden_size != args.num_attention_heads * args.attention_head_size:
+        raise ValueError(
+            "hidden_size must equal num_attention_heads * attention_head_size"
+        )
 
-    configure_fp32()
+    configure_fp32(args.fp32_precision)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda")
     dtype = DTYPES[args.dtype]
     reference, target, rel_embeddings, preparation_ms = make_models(
+        args.scope,
         args.implementation,
         dtype,
         device,
         args.seed,
+        args.hidden_size,
+        args.num_attention_heads,
+        args.attention_head_size,
+        args.fuse_qkv,
+        args.fp32_precision,
+        args.lengths,
+        args.num_hidden_layers,
+        args.intermediate_size,
+        args.conv_kernel_size,
     )
     embedding_table = make_embedding_table(
         args.vocab_size,
-        768,
+        args.hidden_size,
         dtype,
         device,
         args.seed + 2,
@@ -292,19 +396,28 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
 
     metadata = {
         "implementation": args.implementation,
+        "scope": args.scope,
         "dtype": args.dtype,
         "execution": args.execution,
         "compile_mode": args.compile_mode if args.execution == "compile" else None,
         "fullgraph": args.fullgraph if args.execution == "compile" else None,
         "dynamic_batch": args.dynamic if args.execution == "compile" else None,
         "preparation_ms": preparation_ms,
+        "hidden_size": args.hidden_size,
+        "num_attention_heads": args.num_attention_heads,
+        "attention_head_size": args.attention_head_size,
+        "fuse_qkv": args.fuse_qkv,
+        "fp32_precision": args.fp32_precision,
+        "num_hidden_layers": args.num_hidden_layers,
+        "intermediate_size": args.intermediate_size,
+        "conv_kernel_size": args.conv_kernel_size,
         "gpu": torch.cuda.get_device_name(0),
         "compute_capability": list(torch.cuda.get_device_capability(0)),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
     }
     print(
-        f"worker implementation={args.implementation} dtype={args.dtype} "
+        f"worker scope={args.scope} implementation={args.implementation} dtype={args.dtype} "
         f"execution={args.execution} gpu={metadata['gpu']} "
         f"prepare={preparation_ms:.3f} ms",
         flush=True,
@@ -314,6 +427,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     with torch.inference_mode():
         for sequence_length in args.lengths:
             eager_call = make_callable(
+                args.scope,
                 args.implementation,
                 target,
                 rel_embeddings,
@@ -401,6 +515,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 peak_allocated_bytes = torch.cuda.max_memory_allocated()
                 peak_reserved_bytes = torch.cuda.max_memory_reserved()
                 max_error, mean_error = compare_outputs(
+                    args.scope,
                     reference,
                     call,
                     rel_embeddings,
@@ -461,7 +576,8 @@ def print_summary(payloads: list[dict[str, Any]]) -> None:
             baseline[key] = result["p50_ms"]
 
     print()
-    print("Final CUDA attention summary")
+    scopes = sorted({payload["metadata"]["scope"] for payload in payloads})
+    print(f"Final CUDA {'/'.join(scopes)} summary")
     print(
         f"{'dtype':>5} {'execution':>9} {'implementation':>14} {'B':>3} {'L':>4} "
         f"{'p50 ms':>10} {'p90 ms':>10} {'speedup':>9} "
@@ -513,6 +629,8 @@ def run_parent(args: argparse.Namespace) -> None:
                         "-m",
                         "attention.benchmark_cuda",
                         "--worker",
+                        "--scope",
+                        args.scope,
                         "--implementation",
                         implementation,
                         "--dtype",
@@ -537,7 +655,22 @@ def run_parent(args: argparse.Namespace) -> None:
                         str(args.minimum_length_fraction),
                         "--seed",
                         str(args.seed),
+                        "--hidden-size",
+                        str(args.hidden_size),
+                        "--num-attention-heads",
+                        str(args.num_attention_heads),
+                        "--attention-head-size",
+                        str(args.attention_head_size),
+                        "--fp32-precision",
+                        args.fp32_precision,
+                        "--num-hidden-layers",
+                        str(args.num_hidden_layers),
+                        "--intermediate-size",
+                        str(args.intermediate_size),
+                        "--conv-kernel-size",
+                        str(args.conv_kernel_size),
                     ]
+                    command.append("--fuse-qkv" if args.fuse_qkv else "--no-fuse-qkv")
                     command.append("--fullgraph" if args.fullgraph else "--no-fullgraph")
                     command.append("--dynamic" if args.dynamic else "--static")
                     print()
@@ -562,6 +695,7 @@ def run_parent(args: argparse.Namespace) -> None:
     aggregate = {
         "requested": {
             "implementations": args.implementations,
+            "scope": args.scope,
             "dtypes": args.dtypes,
             "executions": args.executions,
             "batches": args.batches,
@@ -571,6 +705,14 @@ def run_parent(args: argparse.Namespace) -> None:
             "compile_mode": args.compile_mode,
             "fullgraph": args.fullgraph,
             "dynamic": args.dynamic,
+            "hidden_size": args.hidden_size,
+            "num_attention_heads": args.num_attention_heads,
+            "attention_head_size": args.attention_head_size,
+            "fuse_qkv": args.fuse_qkv,
+            "fp32_precision": args.fp32_precision,
+            "num_hidden_layers": args.num_hidden_layers,
+            "intermediate_size": args.intermediate_size,
+            "conv_kernel_size": args.conv_kernel_size,
         },
         "workers": payloads,
         "failures": failures,
@@ -588,6 +730,7 @@ def run_parent(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--scope", choices=["attention", "encoder"], default="attention")
     parser.add_argument(
         "--implementations",
         type=parse_csv,
@@ -604,6 +747,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
+    parser.add_argument("--hidden-size", type=int, default=768)
+    parser.add_argument("--num-attention-heads", type=int, default=12)
+    parser.add_argument("--attention-head-size", type=int, default=64)
+    parser.add_argument("--num-hidden-layers", type=int, default=12)
+    parser.add_argument("--intermediate-size", type=int, default=3072)
+    parser.add_argument("--conv-kernel-size", type=int, default=3)
+    parser.add_argument(
+        "--fp32-precision",
+        choices=["strict", "fast"],
+        default="strict",
+    )
+    parser.add_argument(
+        "--fuse-qkv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--vocab-size", type=int, default=8192)
     parser.add_argument("--minimum-length-fraction", type=float, default=0.60)
     parser.add_argument("--seed", type=int, default=17)
