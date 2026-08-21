@@ -25,22 +25,54 @@ except ImportError:  # Triton is intentionally optional on CPU and macOS.
 
 
 if triton is not None:
-    # One kernel, with launch schedules spanning the short GLiNER regime and
-    # the longer streamed-attention regime.  The early pruner below keeps each
-    # tuning run deliberately small for its sequence-length class.
+    # Conservative schedules for this DeBERTa kernel.
+    #
+    # This kernel carries more live state than vanilla FlashAttention:
+    #   * Q/K/V tiles
+    #   * FP32 online-softmax accumulator
+    #   * score tile
+    #   * C2P/P2C lookup state
+    #   * relative-position indices and masks
+    #
+    # Keep the default search space within 64x64 and one pipeline stage.
+    # Larger/deeper schedules can be reintroduced later as architecture-specific
+    # opt-in candidates after profiling their actual register/SMEM usage.
     _AUTOTUNE_CONFIGS = [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=2),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config(
+            {"BLOCK_M": 16, "BLOCK_N": 16},
+            num_warps=2,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 16, "BLOCK_N": 32},
+            num_warps=2,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 32},
+            num_warps=2,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 32},
+            num_warps=4,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64},
+            num_warps=4,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32},
+            num_warps=4,
+            num_stages=1,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64},
+            num_warps=4,
+            num_stages=1,
+        ),
     ]
 
     def _prune_autotune_configs(
@@ -48,39 +80,81 @@ if triton is not None:
         named_args: dict[str, Any],
         **kwargs: Any,
     ) -> list[Any]:
-        """Avoid compiling obviously wasteful or register-heavy candidates."""
+        """Keep only resource-safe candidates useful for the current shape."""
 
         sequence_length_value = kwargs.get(
             "SEQUENCE_LENGTH",
             named_args.get("SEQUENCE_LENGTH"),
         )
-        head_dim_value = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
+        head_dim_value = kwargs.get(
+            "HEAD_DIM",
+            named_args.get("HEAD_DIM"),
+        )
+        is_fp32_value = kwargs.get(
+            "IS_FP32",
+            named_args.get("IS_FP32"),
+        )
+
         if sequence_length_value is None or head_dim_value is None:
             return configs
+
         sequence_length = int(sequence_length_value)
         head_dim = int(head_dim_value)
+        is_fp32 = bool(is_fp32_value)
+
         if sequence_length <= 16:
-            allowed_m = {16}
-            allowed_n = {16, 32}
+            allowed_shapes = {
+                (16, 16),
+                (16, 32),
+            }
         elif sequence_length <= 32:
-            allowed_m = {16, 32}
-            allowed_n = {16, 32}
+            allowed_shapes = {
+                (16, 16),
+                (16, 32),
+                (32, 32),
+            }
         elif sequence_length <= 64:
-            allowed_m = {32, 64}
-            allowed_n = {32, 64}
+            allowed_shapes = {
+                (32, 32),
+                (32, 64),
+                (64, 32),
+                (64, 64),
+            }
         elif sequence_length <= 128:
-            allowed_m = {32, 64}
-            allowed_n = {64, 128}
+            allowed_shapes = {
+                (32, 32),
+                (32, 64),
+                (64, 32),
+                (64, 64),
+            }
         else:
-            allowed_m = {64, 128}
-            allowed_n = {64, 128}
+            # Long sequences still work perfectly well with smaller streamed
+            # tiles. Sequence length does not require BLOCK_M/BLOCK_N ~= L.
+            allowed_shapes = {
+                (32, 32),
+                (32, 64),
+                (64, 32),
+                (64, 64),
+            }
+
+        # FP32 and D=128 materially increase live state. Do not attempt the
+        # largest 64x64 tile in these cases until it has been validated for the
+        # target GPU.
+        if is_fp32 or head_dim == 128:
+            allowed_shapes.discard((64, 64))
+
         kept = [
             config
             for config in configs
-            if config.kwargs["BLOCK_M"] in allowed_m
-            and config.kwargs["BLOCK_N"] in allowed_n
-            and not (head_dim == 128 and config.kwargs["BLOCK_M"] == 128)
+            if (
+                config.kwargs["BLOCK_M"],
+                config.kwargs["BLOCK_N"],
+            )
+            in allowed_shapes
         ]
+
+        # 32x32 is deliberately present as a conservative fallback for every
+        # non-tiny sequence class.
         return kept or configs[:1]
 
     @triton.jit
