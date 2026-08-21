@@ -1,6 +1,10 @@
 """Standalone DeBERTa-v2/v3 attention implementations."""
 
-from .encoder import DebertaV2InferenceEncoder, enable_deberta_v2_inference
+from .encoder import (
+    DebertaV2InferenceEncoder,
+    compile_deberta_buckets,
+    enable_deberta_v2_inference,
+)
 from .optimized import InferenceDisentangledSelfAttention, PreparedPositionPlan
 from .original import (
     BaseModelOutput,
@@ -25,6 +29,7 @@ __all__ = [
     "DebertaV2Encoder",
     "DisentangledSelfAttention",
     "DebertaV2InferenceEncoder",
+    "compile_deberta_buckets",
     "enable_deberta_v2_inference",
     "OriginalDisentangledSelfAttention",
     "InferenceDisentangledSelfAttention",

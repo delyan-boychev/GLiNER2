@@ -33,10 +33,6 @@ if triton is not None:
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
     ]
 
-    @triton.autotune(
-        configs=_AUTOTUNE_CONFIGS,
-        key=["SEQUENCE_LENGTH", "HEAD_DIM", "IS_FP32", "STRICT_FP32"],
-    )
     @triton.jit
     def _deberta_attention_forward_kernel(
         query,
@@ -213,6 +209,12 @@ if triton is not None:
         )
 
 
+    _deberta_attention_autotuned_kernel = triton.autotune(
+        configs=_AUTOTUNE_CONFIGS,
+        key=["SEQUENCE_LENGTH", "HEAD_DIM", "IS_FP32", "STRICT_FP32"],
+    )(_deberta_attention_forward_kernel)
+
+
     def _launch_deberta_attention(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -230,6 +232,7 @@ if triton is not None:
         is_bf16: bool,
         is_fp32: bool,
         strict_fp32: bool,
+        use_autotune: bool,
     ) -> torch.Tensor:
         output = torch.empty_like(query)
 
@@ -239,26 +242,58 @@ if triton is not None:
                 query.size(0) * num_heads,
             )
 
-        torch.library.wrap_triton(_deberta_attention_forward_kernel)[grid](
-            query,
-            key,
-            value,
-            c2p,
-            p2c,
-            delta_to_local,
-            attention_mask,
-            output,
-            active_slots,
-            NUM_HEADS=num_heads,
-            SEQUENCE_LENGTH=sequence_length,
-            HEAD_DIM=query.size(-1),
-            SCORE_SCALE_LOG2=score_scale_log2,
-            HAS_C2P=has_c2p,
-            HAS_P2C=has_p2c,
-            IS_BF16=is_bf16,
-            IS_FP32=is_fp32,
-            STRICT_FP32=strict_fp32,
+        kernel = (
+            _deberta_attention_autotuned_kernel
+            if use_autotune
+            else _deberta_attention_forward_kernel
         )
+        kernel_kwargs = {
+            "NUM_HEADS": num_heads,
+            "SEQUENCE_LENGTH": sequence_length,
+            "HEAD_DIM": query.size(-1),
+            "SCORE_SCALE_LOG2": score_scale_log2,
+            "HAS_C2P": has_c2p,
+            "HAS_P2C": has_p2c,
+            "IS_BF16": is_bf16,
+            "IS_FP32": is_fp32,
+            "STRICT_FP32": strict_fp32,
+        }
+        if use_autotune:
+            torch.library.wrap_triton(kernel)[grid](
+                query,
+                key,
+                value,
+                c2p,
+                p2c,
+                delta_to_local,
+                attention_mask,
+                output,
+                active_slots,
+                **kernel_kwargs,
+            )
+        else:
+            if sequence_length <= 32:
+                block_m, block_n, num_warps, num_stages = 16, 32, 4, 2
+            elif sequence_length <= 128:
+                block_m, block_n, num_warps, num_stages = 32, 64, 4, 3
+            else:
+                block_m, block_n, num_warps, num_stages = 64, 64, 8, 3
+            torch.library.wrap_triton(kernel)[grid](
+                query,
+                key,
+                value,
+                c2p,
+                p2c,
+                delta_to_local,
+                attention_mask,
+                output,
+                active_slots,
+                BLOCK_M=block_m,
+                BLOCK_N=block_n,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                **kernel_kwargs,
+            )
         return output
 
 
@@ -318,6 +353,7 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
         position_plan_cache: SharedPositionPlanCache | None = None,
         fuse_qkv: bool = False,
         fp32_precision: str = "strict",
+        autotune: bool = True,
     ) -> None:
         super().__init__(
             config,
@@ -327,6 +363,7 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
         self.fp32_precision = fp32_precision
+        self.autotune = autotune
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
@@ -441,6 +478,7 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
             hidden_states.dtype == torch.bfloat16,
             hidden_states.dtype == torch.float32,
             self.fp32_precision == "strict",
+            self.autotune,
         )
         context_layer = (
             output.permute(0, 2, 1, 3)

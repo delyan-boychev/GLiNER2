@@ -9,8 +9,10 @@ plans directly to the standalone attention implementations.
 
 from __future__ import annotations
 
+import inspect
+import types
 from collections.abc import Iterable
-from typing import Any, Union
+from typing import Any, Callable, Mapping, Union
 
 import torch
 from torch import nn
@@ -50,6 +52,7 @@ class DebertaV2InferenceEncoder(nn.Module):
         backend: str = "triton",
         fuse_qkv: bool = False,
         fp32_precision: str = "strict",
+        triton_autotune: bool = True,
     ) -> None:
         super().__init__()
         if backend not in {"optimized", "triton"}:
@@ -108,6 +111,7 @@ class DebertaV2InferenceEncoder(nn.Module):
             }
             if backend == "triton":
                 kwargs["fp32_precision"] = fp32_precision
+                kwargs["autotune"] = triton_autotune
             replacement = attention_class(config, **kwargs)
             replacement.load_state_dict(original_attention.state_dict(), strict=True)
             replacement.to(
@@ -319,6 +323,7 @@ def enable_deberta_v2_inference(
     sequence_lengths: Iterable[int] | int | None = None,
     fuse_qkv: bool = False,
     fp32_precision: str = "strict",
+    triton_autotune: bool = True,
 ) -> nn.Module:
     """Replace a HF DeBERTa-v2/v3 encoder without changing checkpoint keys.
 
@@ -343,6 +348,7 @@ def enable_deberta_v2_inference(
         backend=backend,
         fuse_qkv=fuse_qkv,
         fp32_precision=fp32_precision,
+        triton_autotune=triton_autotune,
     )
     model.train(was_training)
     if sequence_lengths is not None:
@@ -353,4 +359,91 @@ def enable_deberta_v2_inference(
     return model
 
 
-__all__ = ["DebertaV2InferenceEncoder", "enable_deberta_v2_inference"]
+def compile_deberta_buckets(
+    encoder: DebertaV2InferenceEncoder,
+    sequence_lengths: Iterable[int] | None = None,
+    *,
+    mode: str = "max-autotune-no-cudagraphs",
+    fullgraph: bool = True,
+    dynamic_batch: bool = True,
+    examples: Mapping[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
+) -> dict[int, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]:
+    """Create isolated compiled encoder callables for prepared length buckets.
+
+    PyTorch 2.13+'s ``isolate_recompiles`` prevents bucket factories from
+    sharing one code object's recompile budget.  On older PyTorch releases, a
+    distinct cloned code object provides the documented compatibility
+    workaround.  Supplying ``examples`` executes one example per bucket so
+    Dynamo, Inductor, and Triton autotuning finish during startup.
+    """
+
+    if sequence_lengths is None:
+        lengths = tuple(sorted(encoder._prepared_plans))
+    else:
+        lengths = tuple(dict.fromkeys(int(length) for length in sequence_lengths))
+    missing = [length for length in lengths if length not in encoder._prepared_plans]
+    if missing:
+        raise ValueError(f"unprepared bucket lengths: {missing}")
+
+    supports_isolation = "isolate_recompiles" in inspect.signature(
+        torch.compile
+    ).parameters
+    compiled: dict[int, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {}
+
+    def make_forward(
+        plans: tuple[PositionPlan, ...],
+    ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        def bucket_forward(
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor,
+        ) -> torch.Tensor:
+            return encoder.forward_prepared(
+                hidden_states,
+                attention_mask,
+                plans,
+                output_hidden_states=False,
+            ).last_hidden_state
+
+        return bucket_forward
+
+    for length in lengths:
+        function = make_forward(encoder._prepared_plans[length])
+        compile_kwargs: dict[str, Any] = {
+            "mode": mode,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic_batch,
+        }
+        if supports_isolation:
+            compile_kwargs["isolate_recompiles"] = True
+        else:
+            clone = types.FunctionType(
+                function.__code__.replace(),
+                function.__globals__,
+                name=f"deberta_bucket_{length}",
+                argdefs=function.__defaults__,
+                closure=function.__closure__,
+            )
+            clone.__kwdefaults__ = function.__kwdefaults__
+            function = clone
+        compiled[length] = torch.compile(function, **compile_kwargs)
+
+    if examples is not None:
+        with torch.inference_mode():
+            for length, function in compiled.items():
+                try:
+                    hidden_states, attention_mask = examples[length]
+                except KeyError as error:
+                    raise ValueError(f"missing compilation example for bucket {length}") from error
+                if hidden_states.size(1) != length:
+                    raise ValueError(
+                        f"bucket {length} example has sequence length {hidden_states.size(1)}"
+                    )
+                function(hidden_states, attention_mask)
+    return compiled
+
+
+__all__ = [
+    "DebertaV2InferenceEncoder",
+    "compile_deberta_buckets",
+    "enable_deberta_v2_inference",
+]

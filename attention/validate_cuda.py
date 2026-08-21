@@ -13,7 +13,13 @@ from typing import Callable
 
 import torch
 
-from .benchmark_cuda import configure_fp32, initialize_parameters, parse_csv, parse_csv_ints
+from .benchmark_cuda import (
+    compile_isolated,
+    configure_fp32,
+    initialize_parameters,
+    parse_csv,
+    parse_csv_ints,
+)
 from .optimized import InferenceDisentangledSelfAttention
 from .original import (
     DebertaAttentionConfig,
@@ -83,6 +89,7 @@ def build_pair(
     position_mode: str,
     fuse_qkv: bool,
     fp32_precision: str,
+    triton_autotune: bool,
     seed: int,
 ) -> tuple[
     OriginalDisentangledSelfAttention,
@@ -111,6 +118,7 @@ def build_pair(
             config,
             fuse_qkv=fuse_qkv,
             fp32_precision=fp32_precision,
+            autotune=triton_autotune,
         )
     else:
         target = InferenceDisentangledSelfAttention(config, fuse_qkv=fuse_qkv)
@@ -156,6 +164,11 @@ def main() -> None:
     parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
     parser.add_argument("--fp32-precision", choices=["strict", "fast"], default="strict")
     parser.add_argument("--fuse-qkv", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--triton-autotune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--seed", type=int, default=29)
     parser.add_argument("--output", default="attention_cuda_validation.json")
     args = parser.parse_args()
@@ -188,6 +201,7 @@ def main() -> None:
                         position_mode,
                         args.fuse_qkv,
                         args.fp32_precision,
+                        args.triton_autotune,
                         args.seed,
                     )
                     with torch.inference_mode():
@@ -207,7 +221,7 @@ def main() -> None:
                             for execution in args.executions:
                                 call: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
                                 if execution == "compile":
-                                    call = torch.compile(
+                                    call = compile_isolated(
                                         eager_call,
                                         mode=args.compile_mode,
                                         fullgraph=True,

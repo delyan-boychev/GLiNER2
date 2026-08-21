@@ -16,6 +16,7 @@ measured iteration receives a different token batch and padding pattern.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 from typing import Any, Callable
 
@@ -79,6 +81,41 @@ def configure_fp32(precision: str) -> None:
         )
     except (AttributeError, RuntimeError):
         torch.backends.cuda.matmul.allow_tf32 = precision == "fast"
+
+
+def compile_isolated(
+    function: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    *,
+    mode: str,
+    fullgraph: bool,
+    dynamic: bool,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Compile one bucket without sharing Dynamo's per-code-object budget.
+
+    PyTorch 2.13 added ``isolate_recompiles=True`` for this exact factory
+    pattern.  Older releases use the officially documented code-object cloning
+    workaround so separate length buckets cannot exhaust one another's default
+    eight-entry recompile limit.
+    """
+
+    compile_kwargs: dict[str, Any] = {
+        "mode": mode,
+        "fullgraph": fullgraph,
+        "dynamic": dynamic,
+    }
+    if "isolate_recompiles" in inspect.signature(torch.compile).parameters:
+        compile_kwargs["isolate_recompiles"] = True
+    elif isinstance(function, types.FunctionType):
+        clone = types.FunctionType(
+            function.__code__.replace(),
+            function.__globals__,
+            name=function.__name__,
+            argdefs=function.__defaults__,
+            closure=function.__closure__,
+        )
+        clone.__kwdefaults__ = function.__kwdefaults__
+        function = clone
+    return torch.compile(function, **compile_kwargs)
 
 
 def initialize_parameters(module: torch.nn.Module, seed: int) -> None:
@@ -160,6 +197,7 @@ def make_models(
     attention_head_size: int,
     fuse_qkv: bool,
     fp32_precision: str,
+    triton_autotune: bool,
     sequence_lengths: list[int],
     num_hidden_layers: int,
     intermediate_size: int,
@@ -203,10 +241,14 @@ def make_models(
                 backend=implementation,
                 fuse_qkv=fuse_qkv,
                 fp32_precision=fp32_precision,
+                triton_autotune=triton_autotune,
             )
     elif implementation == "triton":
         target = TritonInferenceDisentangledSelfAttention(
-            config, fuse_qkv=fuse_qkv, fp32_precision=fp32_precision
+            config,
+            fuse_qkv=fuse_qkv,
+            fp32_precision=fp32_precision,
+            autotune=triton_autotune,
         )
         target.load_state_dict(reference.state_dict(), strict=True)
     elif implementation == "optimized":
@@ -381,6 +423,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         args.attention_head_size,
         args.fuse_qkv,
         args.fp32_precision,
+        args.triton_autotune,
         args.lengths,
         args.num_hidden_layers,
         args.intermediate_size,
@@ -408,6 +451,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         "attention_head_size": args.attention_head_size,
         "fuse_qkv": args.fuse_qkv,
         "fp32_precision": args.fp32_precision,
+        "triton_autotune": args.triton_autotune,
         "num_hidden_layers": args.num_hidden_layers,
         "intermediate_size": args.intermediate_size,
         "conv_kernel_size": args.conv_kernel_size,
@@ -435,7 +479,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 device,
             )
             if args.execution == "compile":
-                call = torch.compile(
+                call = compile_isolated(
                     eager_call,
                     mode=args.compile_mode,
                     fullgraph=args.fullgraph,
@@ -671,6 +715,11 @@ def run_parent(args: argparse.Namespace) -> None:
                         str(args.conv_kernel_size),
                     ]
                     command.append("--fuse-qkv" if args.fuse_qkv else "--no-fuse-qkv")
+                    command.append(
+                        "--triton-autotune"
+                        if args.triton_autotune
+                        else "--no-triton-autotune"
+                    )
                     command.append("--fullgraph" if args.fullgraph else "--no-fullgraph")
                     command.append("--dynamic" if args.dynamic else "--static")
                     print()
@@ -710,6 +759,7 @@ def run_parent(args: argparse.Namespace) -> None:
             "attention_head_size": args.attention_head_size,
             "fuse_qkv": args.fuse_qkv,
             "fp32_precision": args.fp32_precision,
+            "triton_autotune": args.triton_autotune,
             "num_hidden_layers": args.num_hidden_layers,
             "intermediate_size": args.intermediate_size,
             "conv_kernel_size": args.conv_kernel_size,
@@ -762,6 +812,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fuse-qkv",
         action=argparse.BooleanOptionalAction,
         default=False,
+    )
+    parser.add_argument(
+        "--triton-autotune",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument("--vocab-size", type=int, default=8192)
     parser.add_argument("--minimum-length-fraction", type=float, default=0.60)
