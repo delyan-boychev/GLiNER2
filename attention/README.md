@@ -29,20 +29,15 @@ python -m attention.benchmark_cuda \
   --output encoder_attention_cuda_results.json
 ```
 
-Triton autotuning is enabled by default. Triton prints the tuning time and
-winning launch configuration for every new length/head/precision key. Compare
-the exact same kernel with and without launch autotuning by running:
+The Triton backend always autotunes its single non-causal attention kernel.
+Triton prints the tuning time and winning launch configuration for every new
+length/head-dimension/dtype/precision key. Batch size and head count are not
+specialization keys. To benchmark it against the copied baseline:
 
 ```bash
 python -m attention.benchmark_cuda \
   --implementations original,triton \
-  --triton-autotune \
-  --output triton_autotuned.json
-
-python -m attention.benchmark_cuda \
-  --implementations original,triton \
-  --no-triton-autotune \
-  --output triton_manual_launch.json
+  --output triton_results.json
 ```
 
 The compiled bucket factory uses `isolate_recompiles=True` on PyTorch 2.13+.
