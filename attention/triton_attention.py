@@ -25,13 +25,22 @@ except ImportError:  # Triton is intentionally optional on CPU and macOS.
 
 
 if triton is not None:
+    # One kernel, with launch schedules spanning the short GLiNER regime and
+    # the longer streamed-attention regime.  The early pruner below keeps each
+    # tuning run deliberately small for its sequence-length class.
     _AUTOTUNE_CONFIGS = [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=2),
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
     ]
 
     def _prune_autotune_configs(
@@ -50,13 +59,26 @@ if triton is not None:
             return configs
         sequence_length = int(sequence_length_value)
         head_dim = int(head_dim_value)
-        maximum_m = max(16, sequence_length)
-        maximum_n = max(32, sequence_length)
+        if sequence_length <= 16:
+            allowed_m = {16}
+            allowed_n = {16, 32}
+        elif sequence_length <= 32:
+            allowed_m = {16, 32}
+            allowed_n = {16, 32}
+        elif sequence_length <= 64:
+            allowed_m = {32, 64}
+            allowed_n = {32, 64}
+        elif sequence_length <= 128:
+            allowed_m = {32, 64}
+            allowed_n = {64, 128}
+        else:
+            allowed_m = {64, 128}
+            allowed_n = {64, 128}
         kept = [
             config
             for config in configs
-            if config.kwargs["BLOCK_M"] <= maximum_m
-            and config.kwargs["BLOCK_N"] <= maximum_n
+            if config.kwargs["BLOCK_M"] in allowed_m
+            and config.kwargs["BLOCK_N"] in allowed_n
             and not (head_dim == 128 and config.kwargs["BLOCK_M"] == 128)
         ]
         return kept or configs[:1]
@@ -239,7 +261,13 @@ if triton is not None:
 
     _autotune_kwargs: dict[str, Any] = {
         "configs": _AUTOTUNE_CONFIGS,
-        "key": ["SEQUENCE_LENGTH", "HEAD_DIM", "IS_FP32", "STRICT_FP32"],
+        "key": [
+            "SEQUENCE_LENGTH",
+            "HEAD_DIM",
+            "IS_BF16",
+            "IS_FP32",
+            "STRICT_FP32",
+        ],
         "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
     }
     if "cache_results" in inspect.signature(triton.autotune).parameters:
@@ -266,7 +294,6 @@ if triton is not None:
         is_bf16: bool,
         is_fp32: bool,
         strict_fp32: bool,
-        use_autotune: bool,
     ) -> torch.Tensor:
         output = torch.empty_like(query)
 
@@ -276,11 +303,6 @@ if triton is not None:
                 query.size(0) * num_heads,
             )
 
-        kernel = (
-            _deberta_attention_autotuned_kernel
-            if use_autotune
-            else _deberta_attention_forward_kernel
-        )
         kernel_kwargs = {
             "NUM_HEADS": num_heads,
             "SEQUENCE_LENGTH": sequence_length,
@@ -292,42 +314,18 @@ if triton is not None:
             "IS_FP32": is_fp32,
             "STRICT_FP32": strict_fp32,
         }
-        if use_autotune:
-            torch.library.wrap_triton(kernel)[grid](
-                query,
-                key,
-                value,
-                c2p,
-                p2c,
-                delta_to_local,
-                attention_mask,
-                output,
-                active_slots,
-                **kernel_kwargs,
-            )
-        else:
-            if sequence_length <= 32:
-                block_m, block_n, num_warps, num_stages = 16, 32, 4, 2
-            elif sequence_length <= 128:
-                block_m, block_n, num_warps, num_stages = 32, 64, 4, 3
-            else:
-                block_m, block_n, num_warps, num_stages = 64, 64, 8, 3
-            torch.library.wrap_triton(kernel)[grid](
-                query,
-                key,
-                value,
-                c2p,
-                p2c,
-                delta_to_local,
-                attention_mask,
-                output,
-                active_slots,
-                BLOCK_M=block_m,
-                BLOCK_N=block_n,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                **kernel_kwargs,
-            )
+        torch.library.wrap_triton(_deberta_attention_autotuned_kernel)[grid](
+            query,
+            key,
+            value,
+            c2p,
+            p2c,
+            delta_to_local,
+            attention_mask,
+            output,
+            active_slots,
+            **kernel_kwargs,
+        )
         return output
 
 
@@ -387,7 +385,6 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
         position_plan_cache: SharedPositionPlanCache | None = None,
         fuse_qkv: bool = False,
         fp32_precision: str = "strict",
-        autotune: bool = True,
     ) -> None:
         super().__init__(
             config,
@@ -397,7 +394,6 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
         self.fp32_precision = fp32_precision
-        self.autotune = autotune
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
@@ -512,7 +508,6 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
             hidden_states.dtype == torch.bfloat16,
             hidden_states.dtype == torch.float32,
             self.fp32_precision == "strict",
-            self.autotune,
         )
         context_layer = (
             output.permute(0, 2, 1, 3)

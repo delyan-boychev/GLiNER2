@@ -90,7 +90,6 @@ def build_pair(
     position_mode: str,
     fuse_qkv: bool,
     fp32_precision: str,
-    triton_autotune: bool,
     seed: int,
 ) -> tuple[
     OriginalDisentangledSelfAttention,
@@ -119,7 +118,6 @@ def build_pair(
             config,
             fuse_qkv=fuse_qkv,
             fp32_precision=fp32_precision,
-            autotune=triton_autotune,
         )
     else:
         target = InferenceDisentangledSelfAttention(config, fuse_qkv=fuse_qkv)
@@ -165,11 +163,6 @@ def main() -> None:
     parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
     parser.add_argument("--fp32-precision", choices=["strict", "fast"], default="strict")
     parser.add_argument("--fuse-qkv", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument(
-        "--triton-autotune",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--seed", type=int, default=29)
     parser.add_argument("--output", default="attention_cuda_validation.json")
     args = parser.parse_args()
@@ -190,7 +183,7 @@ def main() -> None:
         raise ValueError("head dimensions must be selected from 32, 64, and 128")
 
     configure_fp32(args.fp32_precision)
-    if "triton" in args.backends and args.triton_autotune:
+    if "triton" in args.backends:
         os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
     rows = []
     for dtype_name in args.dtypes:
@@ -204,7 +197,6 @@ def main() -> None:
                         position_mode,
                         args.fuse_qkv,
                         args.fp32_precision,
-                        args.triton_autotune,
                         args.seed,
                     )
                     with torch.inference_mode():
