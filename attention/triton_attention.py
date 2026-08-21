@@ -34,9 +34,9 @@ if triton is not None:
     #   * C2P/P2C lookup state
     #   * relative-position indices and masks
     #
-    # Keep the default search space within 64x64 and one pipeline stage.
-    # Larger/deeper schedules can be reintroduced later as architecture-specific
-    # opt-in candidates after profiling their actual register/SMEM usage.
+    # Keep all schedules at one pipeline stage. Most candidates stay within
+    # 64x64; a pair of asymmetric larger tiles is retained for FP16/BF16 and
+    # pruned out for heavier FP32/head-dim workloads.
     _AUTOTUNE_CONFIGS = [
         # tiny
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
@@ -88,12 +88,14 @@ if triton is not None:
                 (16, 16),
                 (16, 32),
             }
+
         elif sequence_length <= 32:
             allowed_shapes = {
                 (16, 16),
                 (16, 32),
                 (32, 32),
             }
+
         elif sequence_length <= 64:
             allowed_shapes = {
                 (32, 32),
@@ -101,16 +103,8 @@ if triton is not None:
                 (64, 32),
                 (64, 64),
             }
-        elif sequence_length <= 128:
-            allowed_shapes = {
-                (32, 32),
-                (32, 64),
-                (64, 32),
-                (64, 64),
-            }
+
         else:
-            # Long sequences still work perfectly well with smaller streamed
-            # tiles. Sequence length does not require BLOCK_M/BLOCK_N ~= L.
             allowed_shapes = {
                 (32, 32),
                 (32, 64),
@@ -118,11 +112,15 @@ if triton is not None:
                 (64, 64),
             }
 
-        # FP32 and D=128 materially increase live state. Do not attempt the
-        # largest 64x64 tile in these cases until it has been validated for the
-        # target GPU.
-        if is_fp32 or head_dim == 128:
-            allowed_shapes.discard((64, 64))
+            # Larger tiles are worth testing for FP16/BF16 with normal head sizes.
+            # They use only one pipeline stage, and safe configurations above remain
+            # available if Triton rejects one for resource usage.
+            if not is_fp32 and head_dim <= 64:
+                allowed_shapes.update({
+                    (64, 128),
+                    (128, 64),
+                })
+
 
         kept = [
             config
@@ -149,6 +147,7 @@ if triton is not None:
         attention_mask,
         output,
         ACTIVE_SLOTS: tl.constexpr,
+        BATCH_SIZE: tl.constexpr,
         NUM_HEADS: tl.constexpr,
         SEQUENCE_LENGTH: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -172,7 +171,13 @@ if triton is not None:
         query_base = query + batch_head * SEQUENCE_LENGTH * HEAD_DIM
         key_base = key + batch_head * SEQUENCE_LENGTH * HEAD_DIM
         value_base = value + batch_head * SEQUENCE_LENGTH * HEAD_DIM
-        output_base = output + batch_head * SEQUENCE_LENGTH * HEAD_DIM
+        head = batch_head - batch * NUM_HEADS
+
+        output_base = (
+            output
+            + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM
+            + head * HEAD_DIM
+        )
 
         query_values = tl.load(
             query_base
@@ -191,7 +196,13 @@ if triton is not None:
         row_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
         accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
+        if HAS_C2P:
+            c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+        if HAS_P2C:
+            p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+
         for key_start in tl.range(0, SEQUENCE_LENGTH, BLOCK_N):
+            key_start = tl.multiple_of(key_start, BLOCK_N)
             key_offsets = key_start + tl.arange(0, BLOCK_N)
             key_in_bounds = key_offsets < SEQUENCE_LENGTH
             key_is_kept = tl.load(
@@ -237,7 +248,6 @@ if triton is not None:
             ).to(tl.int32)
 
             if HAS_C2P:
-                c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
                 scores += tl.load(
                     c2p_base
                     + query_offsets[:, None] * ACTIVE_SLOTS
@@ -247,7 +257,6 @@ if triton is not None:
                 )
 
             if HAS_P2C:
-                p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
                 scores += tl.load(
                     p2c_base
                     + key_offsets[None, :] * ACTIVE_SLOTS
@@ -270,11 +279,6 @@ if triton is not None:
                 scores,
             )
 
-            new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
-            correction = tl.math.exp2(row_max - new_row_max)
-            probabilities = tl.math.exp2(scores - new_row_max[:, None])
-            new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
-
             value_values = tl.load(
                 value_base
                 + key_offsets[:, None] * HEAD_DIM
@@ -282,24 +286,72 @@ if triton is not None:
                 mask=key_in_bounds[:, None],
                 other=0.0,
             )
-            accumulator *= correction[:, None]
-            if IS_FP32:
-                if STRICT_FP32:
-                    accumulator += tl.dot(
-                        probabilities,
+
+            # When the complete K/V sequence fits in one tile, avoid the online
+            # softmax recurrence. Both values are constexpr, so Triton removes
+            # the unused branch at compile time.
+            if SEQUENCE_LENGTH <= BLOCK_N:
+                new_row_max = tl.max(scores, axis=1)
+                probabilities = tl.math.exp2(scores - new_row_max[:, None])
+                new_row_sum = tl.sum(probabilities, axis=1)
+
+                if IS_FP32:
+                    if STRICT_FP32:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            input_precision="ieee",
+                        )
+                    else:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            input_precision="tf32",
+                        )
+                elif IS_BF16:
+                    accumulator = tl.dot(
+                        probabilities.to(tl.bfloat16),
                         value_values,
-                        input_precision="ieee",
                     )
                 else:
-                    accumulator += tl.dot(
-                        probabilities,
+                    accumulator = tl.dot(
+                        probabilities.to(tl.float16),
                         value_values,
-                        input_precision="tf32",
                     )
-            elif IS_BF16:
-                accumulator += tl.dot(probabilities.to(tl.bfloat16), value_values)
             else:
-                accumulator += tl.dot(probabilities.to(tl.float16), value_values)
+                new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
+                correction = tl.math.exp2(row_max - new_row_max)
+                probabilities = tl.math.exp2(scores - new_row_max[:, None])
+                new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
+
+                accumulator *= correction[:, None]
+                if IS_FP32:
+                    if STRICT_FP32:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            accumulator,
+                            input_precision="ieee",
+                        )
+                    else:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            accumulator,
+                            input_precision="tf32",
+                        )
+                elif IS_BF16:
+                    accumulator = tl.dot(
+                        probabilities.to(tl.bfloat16),
+                        value_values,
+                        accumulator,
+                    )
+                else:
+                    accumulator = tl.dot(
+                        probabilities.to(tl.float16),
+                        value_values,
+                        accumulator,
+                    )
 
             row_max = new_row_max
             row_sum = new_row_sum
@@ -307,7 +359,7 @@ if triton is not None:
         accumulator /= row_sum[:, None]
         tl.store(
             output_base
-            + query_offsets[:, None] * HEAD_DIM
+            + query_offsets[:, None] * (NUM_HEADS * HEAD_DIM)
             + dimension_offsets[None, :],
             accumulator,
             mask=query_in_bounds[:, None],
@@ -317,8 +369,12 @@ if triton is not None:
     _autotune_kwargs: dict[str, Any] = {
         "configs": _AUTOTUNE_CONFIGS,
         "key": [
+            "BATCH_SIZE",
             "SEQUENCE_LENGTH",
             "HEAD_DIM",
+            "ACTIVE_SLOTS",
+            "HAS_C2P",
+            "HAS_P2C",
             "IS_BF16",
             "IS_FP32",
             "STRICT_FP32",
@@ -350,7 +406,18 @@ if triton is not None:
         is_fp32: bool,
         strict_fp32: bool,
     ) -> torch.Tensor:
-        output = torch.empty_like(query)
+        batch_size = query.size(0)
+        head_dim = query.size(-1)
+
+        output = torch.empty(
+            (
+                batch_size,
+                sequence_length,
+                num_heads * head_dim,
+            ),
+            device=query.device,
+            dtype=query.dtype,
+        )
 
         def grid(meta: dict[str, Any]) -> tuple[int, int]:
             return (
@@ -360,6 +427,7 @@ if triton is not None:
 
         kernel_kwargs = {
             "ACTIVE_SLOTS": active_slots,
+            "BATCH_SIZE": batch_size,
             "NUM_HEADS": num_heads,
             "SEQUENCE_LENGTH": sequence_length,
             "HEAD_DIM": query.size(-1),
@@ -564,12 +632,8 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
             hidden_states.dtype == torch.float32,
             self.fp32_precision == "strict",
         )
-        context_layer = (
-            output.permute(0, 2, 1, 3)
-            .contiguous()
-            .view(batch_size, sequence_length, self.all_head_size)
-        )
-        return context_layer, None
+
+        return output, None
 
     def forward(
         self,
