@@ -54,6 +54,30 @@ def test_boundary_inference_collation_has_layout_without_targets(tiny_tokenizer)
     assert batch.targets is None
 
 
+def test_pinned_relation_head_collapses_the_gold_cross_product(tiny_tokenizer):
+    processor = SchemaTransformer(
+        tokenizer=tiny_tokenizer,
+        sampling_config=SamplingConfig(
+            remove_relations_prob=0.0, swap_head_tail_prob=0.0
+        ),
+    )
+    collator = ExtractorCollator(
+        processor, is_training=True, architecture="boundary", max_gold_per_query=4
+    )
+    text = "Pushkin street runs past the Pushkin monument."
+
+    def gold_pairs(head):
+        batch = collator([
+            (text, {"relations": [{"near": {"head": head, "tail": "monument"}}]})
+        ])
+        pairs, mask = batch.targets.edge_targets[:2]
+        return pairs[mask].tolist()
+
+    # a repeated head surface supervises both cross-products
+    assert gold_pairs("Pushkin") == [[0, 1, 6, 7], [5, 6, 6, 7]]
+    assert gold_pairs({"text": "Pushkin", "start": 29, "end": 36}) == [[5, 6, 6, 7]]
+
+
 def test_boundary_training_rejects_missing_entity_annotation(tiny_tokenizer):
     processor = _processor(tiny_tokenizer)
     collator = ExtractorCollator(processor, is_training=True, architecture="boundary")
