@@ -1173,6 +1173,12 @@ GLiNER2 uses JSONL format where each line contains an `input` and `output` field
 {"input": "OpenAI released GPT-4 in March 2023.", "output": {"entities": {"company": ["OpenAI"], "model": ["GPT-4"], "date": ["March 2023"]}}}
 ```
 
+Or, by setting explicit spans:
+
+```jsonl
+{"input": "Pushkin street runs past the Pushkin monument.", "output": {"entities": {"street": [{"text": "Pushkin", "start": 0, "end": 7}]}}}
+```
+
 **Classification Example:**
 ```jsonl
 {"input": "This movie is absolutely fantastic! I loved every minute of it.", "output": {"classifications": [{"task": "sentiment", "labels": ["positive", "negative", "neutral"], "true_label": ["positive"]}]}}

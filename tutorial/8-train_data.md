@@ -50,7 +50,7 @@ Entities use a simple dictionary where keys are entity types and values are list
 | Component | Type | Required | Description |
 |-----------|------|----------|-------------|
 | Entity type (key) | `str` | Yes | Name of the entity type (e.g., "person", "location") |
-| Entity mentions (value) | `list[str]` | Yes | List of entity text spans found in input |
+| Entity mentions (value) | `list[str]` or `list[dict]` | Yes | List of entity text spans found in input, each a surface string or an explicit span |
 
 **Format**: `{"entity_type": ["mention1", "mention2", ...]}`
 
@@ -62,7 +62,7 @@ Each structure is a dictionary with a parent name as key and field definitions a
 |-----------|------|----------|-------------|
 | Parent name (key) | `str` | Yes | Name of the structure (e.g., "product", "contact") |
 | Fields (value) | `dict` | Yes | Field name → field value mappings |
-| Field value | `str` or `list[str]` or `dict` | Yes | String, list of strings, or choice dict |
+| Field value | `str` or `list[str]` or `dict` | Yes | String, list of strings, explicit span, or choice dict |
 | Choice dict | `dict` with `value` and `choices` | No | For classification-style fields |
 
 **Format**: `[{"parent": {"field1": "value", "field2": ["list", "values"]}}]`
@@ -80,7 +80,7 @@ Relations use flexible field structures - you can use ANY field names (not just 
 |-----------|------|----------|-------------|
 | Relation name (key) | `str` | Yes | Name of the relation type (e.g., "works_for") |
 | Fields (value) | `dict` | Yes | Field name → field value mappings |
-| Field value | `str` or `list[str]` | Yes | String or list of strings |
+| Field value | `str` or `list[str]` or `dict` | Yes | String, list of strings, or explicit span |
 
 **Standard Format**: `[{"relation_name": {"head": "entity1", "tail": "entity2"}}]`
 
@@ -105,6 +105,20 @@ The training data loader supports multiple input formats:
 3. **Dict lists**: List of dictionaries in the same format as JSONL
 
 All formats are automatically detected and converted to the internal format. See `gliner2.training.data.DataLoader_Factory` for details.
+
+### Explicit Spans
+
+Entity mentions, structure field values and relation field values are normally surface strings, which supervise **every** occurrence of that text. To supervise one specific occurrence, give a span instead:
+
+```jsonl
+{"input": "Pushkin street runs past the Pushkin monument.", "output": {"entities": {"street": [{"text": "Pushkin", "start": 0, "end": 7}]}}}
+```
+
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `text` | `str` | Yes | The mention text, verified against the offsets |
+| `start` | `int` | Yes | Character offset into the input |
+| `end` | `int` | Yes | Character offset, exclusive |
 
 ---
 
