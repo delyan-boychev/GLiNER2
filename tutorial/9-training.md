@@ -449,6 +449,39 @@ print(f"Valid: {report['valid']}, Invalid: {report['invalid']}")
 dataset.print_stats()
 ```
 
+`TrainingDataset.validate()`/`InputExample.validate()` check that an entity
+value is an exact *character substring* of the text (case-insensitive).
+That is necessary but not sufficient for the boundary architecture: training
+also requires the value to align to a contiguous run of *tokens*, and the
+word splitter's hyphen/underscore continuation rule (`\w+(?:[-_]\w+)*`) means
+a value can be a real substring yet still fail token alignment -- e.g.
+`"ABS"` inside `"...LEDRemote-ABS-BES3-MY2023.png..."` is swallowed into one
+token by the surrounding hyphen-joined run. A mismatch like this passes
+`validate()` but raises inside `collate_fn_train`/`ExtractorCollator` with
+`architecture="boundary"`. Use
+`SchemaTransformer.find_unalignable_entities(text, entities)` on a single
+`(text, schema)` example to catch this ahead of submitting a full dataset:
+
+```python
+from gliner2 import AutoExtractor
+
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
+processor = model.processor  # the SchemaTransformer backing this model
+
+unalignable = processor.find_unalignable_entities(
+    "See IMG Bosch-eBike-LEDRemote-ABS-BES3-MY2023.png for wiring.",
+    {"PartCode": "ABS"},
+)
+# [{'entity_type': 'PartCode', 'value': 'ABS', 'value_index': None}]
+if unalignable:
+    print(f"{len(unalignable)} listed value(s) will not token-align:", unalignable)
+```
+
+An empty list means every listed value aligns and will not raise during
+training. It reuses the exact tokenizer and sublist search
+`collate_fn_train` uses to build gold targets, so it can never drift from
+actual training behavior.
+
 ### Data Splitting and Management
 
 ```python
@@ -1146,6 +1179,17 @@ example = InputExample(
     text="John works here",
     entities={"person": ["John"]}  # OK
 )
+
+# 1b. Entity IS in text but does not token-align (boundary architecture only)
+# example.validate() passes ("abs" is a substring), but this will still raise
+# from collate_fn_train/ExtractorCollator, because the tokenizer's hyphen
+# continuation rule swallows the whole hyphen-joined run into one token.
+processor.find_unalignable_entities(
+    "See IMG Bosch-eBike-LEDRemote-ABS-BES3-MY2023.png for wiring.",
+    {"PartCode": "ABS"},
+)
+# [{'entity_type': 'PartCode', 'value': 'ABS', 'value_index': None}]
+# Fix: re-annotate with a token-aligned surface, or drop the value.
 
 # 2. Empty entities
 example = InputExample(
