@@ -13,7 +13,7 @@ import importlib.util
 import logging
 import os
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -146,6 +146,207 @@ class BaseExtractorModel(PreTrainedModel):
     uses ``encode()`` while the span model retains its legacy path.
     """
     config_class = ExtractorConfig
+
+    @staticmethod
+    def _disentangled_flash_backend_for_device(device: torch.device) -> str:
+        """Select Triton on NVIDIA CUDA and PyTorch everywhere else."""
+        if device.type == "cuda" and torch.version.hip is None:
+            return "triton"
+        if device.type in {"cpu", "mps", "cuda"}:
+            return "torch"
+        raise RuntimeError(
+            "DisentangledFlash supports NVIDIA CUDA through Triton and "
+            "CPU, MPS, and AMD ROCm through its PyTorch backend; got "
+            f"device {device}."
+        )
+
+    def enable_disentangled_flash(
+        self,
+        *,
+        backend: str = "auto",
+        inference: bool | None = None,
+    ) -> "BaseExtractorModel":
+        """Enable DisentangledFlash for DeBERTa-v2/v3 attention.
+
+        The loaded Hugging Face backbone is optimized in place while retaining
+        its parameter names. In inference mode, sequence-length plans are
+        prepared lazily from GLiNER2's padded inputs and reused on later calls.
+        Training mode keeps the attention parameters in the autograd graph and
+        must be enabled before constructing the optimizer.
+
+        Move the model to its final device and dtype before enabling the
+        backend. Call :meth:`eval` for inference or :meth:`train` for training.
+
+        Args:
+            backend: ``"auto"`` selects Triton for supported NVIDIA CUDA
+                models and the optimized PyTorch implementation otherwise.
+                Pass ``"triton"`` or ``"torch"`` to request one explicitly.
+            inference: Whether to install the prepared inference path. By
+                default, infer this from the model's current training state.
+
+        Returns:
+            The model itself, for method chaining.
+        """
+        if inference is None:
+            inference = not self.training
+        if not isinstance(inference, bool):
+            raise TypeError(
+                f"inference must be a bool or None, got {type(inference).__name__}"
+            )
+        if inference and self.training:
+            raise RuntimeError(
+                "DisentangledFlash inference requires eval mode; call "
+                "model.eval() before enable_disentangled_flash()."
+            )
+        if not inference and not self.training:
+            raise RuntimeError(
+                "DisentangledFlash training requires training mode; call "
+                "model.train() before enable_disentangled_flash(inference=False)."
+            )
+        if backend not in {"auto", "torch", "triton"}:
+            raise ValueError("backend must be 'auto', 'torch', or 'triton'")
+
+        encoder_config = getattr(self.encoder, "config", None)
+        if (
+            encoder_config is None
+            or encoder_config.__class__.__name__ != "DebertaV2Config"
+        ):
+            raise TypeError(
+                "DisentangledFlash supports Hugging Face DeBERTa-v2/v3 "
+                "backbones only."
+            )
+
+        try:
+            from disentangled_flash import (
+                DebertaV2OptimizedEncoder,
+                optimize_deberta,
+            )
+        except ImportError as error:
+            raise ImportError(
+                "DisentangledFlash is optional; install it with "
+                "'pip install gliner2[disentangled-flash]'."
+            ) from error
+
+        existing_mode = getattr(self, "_disentangled_flash_mode", None)
+        requested_mode = "inference" if inference else "training"
+        if existing_mode == requested_mode:
+            return self
+        if existing_mode is not None:
+            raise RuntimeError(
+                "DisentangledFlash is already enabled in "
+                f"{existing_mode} mode; create a fresh model to use "
+                f"{requested_mode} mode."
+            )
+
+        if isinstance(
+            getattr(self.encoder, "encoder", None),
+            DebertaV2OptimizedEncoder,
+        ):
+            raise RuntimeError(
+                "The DeBERTa encoder is already optimized outside GLiNER2; "
+                "refusing to install a second lifecycle hook."
+            )
+
+        parameter = next(self.encoder.parameters())
+        if parameter.dtype not in {
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        }:
+            raise TypeError(
+                "DisentangledFlash supports FP16, BF16, and FP32; encoder "
+                f"dtype is {parameter.dtype}."
+            )
+        enabled_device = parameter.device
+        selected_backend = (
+            BaseExtractorModel._disentangled_flash_backend_for_device(
+                enabled_device
+            )
+            if backend == "auto"
+            else backend
+        )
+
+        optimize_deberta(
+            self.encoder,
+            backend=selected_backend,
+            inference=inference,
+            sequence_lengths=None,
+            fp32_precision="strict",
+        )
+        optimized_encoder = self.encoder.encoder
+        if not isinstance(optimized_encoder, DebertaV2OptimizedEncoder):
+            raise RuntimeError(
+                "DisentangledFlash did not install its optimized DeBERTa "
+                "encoder."
+            )
+
+        self._disentangled_flash_backend = optimized_encoder.backend
+        self._disentangled_flash_mode = requested_mode
+        if not inference:
+            logger.info(
+                "Enabled DisentangledFlash training backend %s",
+                optimized_encoder.backend,
+            )
+            return self
+
+        def prepare_active_length(module, args, kwargs):
+            if self.training or module.training:
+                raise RuntimeError(
+                    "DisentangledFlash inference cannot run in training mode."
+                )
+            if getattr(module, "encoder", None) is not optimized_encoder:
+                raise RuntimeError(
+                    "The DisentangledFlash encoder replacement is no longer "
+                    "active."
+                )
+
+            current_parameter = next(module.parameters())
+            if current_parameter.device != enabled_device:
+                raise RuntimeError(
+                    "The model device changed after DisentangledFlash was "
+                    "enabled. Move the model to its final device first, then "
+                    "enable the backend."
+                )
+            if current_parameter.dtype not in {
+                torch.float16,
+                torch.bfloat16,
+                torch.float32,
+            }:
+                raise TypeError(
+                    "DisentangledFlash supports FP16, BF16, and FP32; encoder "
+                    f"dtype is {current_parameter.dtype}."
+                )
+
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None and args:
+                input_ids = args[0]
+            if input_ids is None or input_ids.ndim != 2:
+                raise ValueError(
+                    "DisentangledFlash requires input_ids with shape [B, L] "
+                    "to select a prepared sequence-length plan."
+                )
+
+            sequence_length = int(input_ids.shape[1])
+            prepared_lengths = tuple(
+                sorted(int(length) for length in optimized_encoder._prepared_plans)
+            )
+            if sequence_length not in prepared_lengths:
+                optimized_encoder.prepare_for_inference(
+                    tuple(sorted(set(prepared_lengths) | {sequence_length}))
+                )
+            optimized_encoder.activate_shape(sequence_length)
+
+        self._disentangled_flash_hook_handle = (
+            self.encoder.register_forward_pre_hook(
+                prepare_active_length,
+                with_kwargs=True,
+            )
+        )
+        logger.info(
+            "Enabled DisentangledFlash inference backend %s",
+            optimized_encoder.backend,
+        )
+        return self
 
     @staticmethod
     def _load_encoder(

@@ -1,0 +1,289 @@
+"""Contract tests for optional DisentangledFlash inference support."""
+
+from __future__ import annotations
+
+import sys
+import types
+
+import pytest
+import torch
+
+from gliner2.models.base import BaseExtractorModel
+from gliner2.models.loading import (
+    apply_post_load_options,
+    pop_attention_backend,
+    split_load_kwargs,
+)
+
+
+class DebertaV2Config:
+    """Class name intentionally matches the Transformers config."""
+
+
+class FakeOptimizedEncoder(torch.nn.Module):
+    def __init__(self, backend="torch"):
+        super().__init__()
+        self.backend = backend
+        self._prepared_plans = {}
+        self.active_length = None
+        self.prepare_calls = []
+
+    def prepare_for_inference(self, lengths):
+        lengths = tuple(int(length) for length in lengths)
+        self.prepare_calls.append(lengths)
+        self._prepared_plans = {length: object() for length in lengths}
+
+    def activate_shape(self, length):
+        if int(length) not in self._prepared_plans:
+            raise ValueError("unprepared length")
+        self.active_length = int(length)
+
+
+class FakeBackbone(torch.nn.Module):
+    def __init__(self, config=None):
+        super().__init__()
+        self.config = config or DebertaV2Config()
+        self.encoder = torch.nn.Identity()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+
+    def forward(self, input_ids=None, attention_mask=None):
+        return input_ids
+
+
+class FakeExtractor:
+    def __init__(self, config=None):
+        self.training = False
+        self.encoder = FakeBackbone(config).eval()
+
+
+def _install_fake_disentangled_flash(monkeypatch):
+    calls = []
+    module = types.ModuleType("disentangled_flash")
+    module.DebertaV2OptimizedEncoder = FakeOptimizedEncoder
+
+    def enable_deberta_inference(
+        model,
+        *,
+        backend="auto",
+        inference=True,
+        sequence_lengths=None,
+        fp32_precision="strict",
+    ):
+        selected_backend = "torch" if backend == "auto" else backend
+        calls.append(
+            {
+                "model": model,
+                "backend": backend,
+                "inference": inference,
+                "sequence_lengths": sequence_lengths,
+                "fp32_precision": fp32_precision,
+            }
+        )
+        model.encoder = FakeOptimizedEncoder(selected_backend)
+        model.encoder.inference = inference
+        return model
+
+    module.optimize_deberta = enable_deberta_inference
+    monkeypatch.setitem(sys.modules, "disentangled_flash", module)
+    return calls
+
+
+def test_enable_requires_eval_mode(monkeypatch):
+    _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor()
+    model.training = True
+
+    with pytest.raises(RuntimeError, match="requires eval mode"):
+        BaseExtractorModel.enable_disentangled_flash(model, inference=True)
+
+
+def test_enable_rejects_non_deberta_backbone(monkeypatch):
+    _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor(config=object())
+
+    with pytest.raises(TypeError, match="DeBERTa-v2/v3"):
+        BaseExtractorModel.enable_disentangled_flash(model)
+
+
+def test_enable_validates_backend_before_import(monkeypatch):
+    model = FakeExtractor()
+
+    with pytest.raises(ValueError, match="backend must be"):
+        BaseExtractorModel.enable_disentangled_flash(model, backend="cuda")
+
+
+def test_auto_backend_selection(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None, raising=False)
+    assert (
+        BaseExtractorModel._disentangled_flash_backend_for_device(
+            torch.device("cuda")
+        )
+        == "triton"
+    )
+    assert (
+        BaseExtractorModel._disentangled_flash_backend_for_device(
+            torch.device("cpu")
+        )
+        == "torch"
+    )
+    assert (
+        BaseExtractorModel._disentangled_flash_backend_for_device(
+            torch.device("mps")
+        )
+        == "torch"
+    )
+    monkeypatch.setattr(torch.version, "hip", "6.0", raising=False)
+    assert (
+        BaseExtractorModel._disentangled_flash_backend_for_device(
+            torch.device("cuda")
+        )
+        == "torch"
+    )
+
+
+def test_enable_installs_backend_and_is_idempotent(monkeypatch):
+    calls = _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor()
+
+    result = BaseExtractorModel.enable_disentangled_flash(model)
+    second_result = BaseExtractorModel.enable_disentangled_flash(model)
+
+    assert result is model
+    assert second_result is model
+    assert calls == [
+        {
+            "model": model.encoder,
+            "backend": "torch",
+            "inference": True,
+            "sequence_lengths": None,
+            "fp32_precision": "strict",
+        }
+    ]
+    assert model._disentangled_flash_backend == "torch"
+    assert model._disentangled_flash_hook_handle is not None
+
+
+def test_forward_hook_prepares_new_lengths_and_reuses_them(monkeypatch):
+    _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor()
+    BaseExtractorModel.enable_disentangled_flash(model, backend="torch")
+    optimized = model.encoder.encoder
+
+    model.encoder(input_ids=torch.ones((2, 8), dtype=torch.long))
+    model.encoder(input_ids=torch.ones((1, 8), dtype=torch.long))
+    model.encoder(input_ids=torch.ones((1, 12), dtype=torch.long))
+
+    assert optimized.prepare_calls == [(8,), (8, 12)]
+    assert optimized.active_length == 12
+
+
+def test_forward_hook_rejects_training_after_enable(monkeypatch):
+    _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor()
+    BaseExtractorModel.enable_disentangled_flash(model)
+    model.training = True
+
+    with pytest.raises(RuntimeError, match="cannot run in training mode"):
+        model.encoder(input_ids=torch.ones((1, 8), dtype=torch.long))
+
+
+def test_training_mode_uses_differentiable_backend_without_hook(monkeypatch):
+    calls = _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor()
+    model.training = True
+    model.encoder.train()
+
+    result = BaseExtractorModel.enable_disentangled_flash(
+        model,
+        backend="torch",
+        inference=False,
+    )
+
+    assert result is model
+    assert calls[0]["inference"] is False
+    assert model._disentangled_flash_mode == "training"
+    assert model._disentangled_flash_backend == "torch"
+    assert not hasattr(model, "_disentangled_flash_hook_handle")
+
+
+def test_standard_load_option_enables_backend_after_device_and_precision(monkeypatch):
+    events = []
+
+    class LoadableModel:
+        def to(self, device):
+            events.append(("to", device))
+            return self
+
+        def quantize(self):
+            events.append(("quantize",))
+            return self
+
+        def eval(self):
+            events.append(("eval",))
+            return self
+
+        def enable_disentangled_flash(self):
+            events.append(("disentangled_flash",))
+            return self
+
+    model = LoadableModel()
+    result = apply_post_load_options(
+        model,
+        map_location="cuda",
+        quantize=True,
+        attention_backend="disentangled_flash",
+    )
+
+    assert result is model
+    assert events == [
+        ("to", "cuda"),
+        ("quantize",),
+        ("eval",),
+        ("disentangled_flash",),
+    ]
+
+
+def test_standard_load_option_is_recognized():
+    model_options, hub_options = split_load_kwargs(
+        {"attention_backend": "disentangled_flash", "revision": "main"}
+    )
+
+    assert model_options == {"attention_backend": "disentangled_flash"}
+    assert hub_options == {"revision": "main"}
+
+
+def test_standard_load_option_rejects_compile_combination():
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        apply_post_load_options(
+            object(),
+            compile_model=True,
+            attention_backend="disentangled_flash",
+        )
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected_flash"),
+    [
+        ("standard", False),
+        ("flashdeberta", True),
+        ("disentangled_flash", False),
+    ],
+)
+def test_unified_attention_backend_selection(requested, expected_flash):
+    options = {"attention_backend": requested}
+
+    backend, use_flashdeberta = pop_attention_backend(options)
+
+    assert backend == requested
+    assert use_flashdeberta is expected_flash
+    assert options == {}
+
+
+def test_unified_backend_rejects_conflicting_legacy_alias():
+    with pytest.raises(ValueError, match="conflicts"):
+        pop_attention_backend(
+            {
+                "attention_backend": "disentangled_flash",
+                "use_flashdeberta": True,
+            }
+        )

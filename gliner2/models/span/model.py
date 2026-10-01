@@ -40,6 +40,7 @@ from gliner2.models.loading import (
     apply_post_load_options,
     checkpoint_file,
     load_checkpoint_state_dict,
+    pop_attention_backend,
     reconcile_encoder_embeddings,
     split_load_kwargs,
 )
@@ -655,9 +656,12 @@ class SpanExtractorModel(BaseExtractorModel):
             compile: If True, torch.compile the encoder and span-rep
                 with ``dynamic=True`` for fused GPU kernels.
             map_location: Device to load the model onto (e.g. "cpu", "cuda").
-            use_flashdeberta: If True, use the optional FlashDeBERTa backend
-                for a compatible DeBERTaV2 encoder. If omitted, defer to the
-                ``USE_FLASHDEBERTA`` environment variable.
+            attention_backend: Encoder attention implementation: ``"standard"``,
+                ``"flashdeberta"``, or ``"disentangled_flash"``.
+            use_flashdeberta: Compatibility alias for selecting
+                ``"flashdeberta"`` or ``"standard"``. If both backend options
+                are omitted, defer to the ``USE_FLASHDEBERTA`` environment
+                variable.
             word_splitter: Built-in splitter name (``"whitespace"`` default,
                 or ``"char"``) or a custom callable. Runtime-only; saved
                 checkpoints reload with the default unless supplied again.
@@ -678,7 +682,9 @@ class SpanExtractorModel(BaseExtractorModel):
         quantize = model_options.pop("quantize", False)
         compile_model = model_options.pop("compile", False)
         map_location = model_options.pop("map_location", None)
-        use_flashdeberta = model_options.pop("use_flashdeberta", None)
+        attention_backend, use_flashdeberta = pop_attention_backend(
+            model_options
+        )
         word_splitter = model_options.pop("word_splitter", None)
 
         if config is None:
@@ -730,6 +736,7 @@ class SpanExtractorModel(BaseExtractorModel):
             map_location=map_location,
             quantize=quantize,
             compile_model=compile_model,
+            attention_backend=attention_backend,
         )
 
     # =========================================================================

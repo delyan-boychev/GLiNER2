@@ -38,6 +38,7 @@ from gliner2.models.loading import (
     apply_post_load_options,
     checkpoint_file,
     load_checkpoint_state_dict,
+    pop_attention_backend,
     reconcile_encoder_embeddings,
     split_load_kwargs,
 )
@@ -2081,7 +2082,9 @@ class BoundaryExtractorModel(BaseExtractorModel):
         quantize = model_options.pop("quantize", False)
         compile_model = model_options.pop("compile", False)
         map_location = model_options.pop("map_location", None)
-        use_flashdeberta = model_options.pop("use_flashdeberta", None)
+        attention_backend, use_flashdeberta = pop_attention_backend(
+            model_options
+        )
         word_splitter = model_options.pop("word_splitter", None)
 
         if config is None:
@@ -2134,6 +2137,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
             quantize=quantize,
             compile_model=compile_model,
             compile_dynamic=True,
+            attention_backend=attention_backend,
         )
 
 
