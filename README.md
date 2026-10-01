@@ -1139,6 +1139,26 @@ model.enable_disentangled_flash(inference=False)
 optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
 ```
 
+Batches that mix short and long inputs carry right padding. By default
+(`packed="auto"`), a batch whose padding fraction reaches `packed_min_padding`
+runs through DisentangledFlash's packed (unpadded) layout, which skips padded
+tokens in attention and in the feed-forward layers. Set the behavior when
+loading:
+
+```python
+model = AutoExtractor.from_pretrained(
+    "fastino/gliner2.5-base-v1",
+    map_location="cuda",
+    attention_backend="disentangled_flash",
+    disentangled_flash_packed="auto",       # "auto", True, or False
+    disentangled_flash_min_padding=0.25,    # padding fraction that triggers packing
+)
+```
+
+or with `model.enable_disentangled_flash(packed=..., packed_min_padding=...)`.
+`benchmarks/benchmark_packed_threshold.py` measures the break-even padding on
+your hardware.
+
 ## 📦 Batch Processing
 
 Process multiple texts efficiently in a single call:

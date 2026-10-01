@@ -129,3 +129,91 @@ def test_training_backend_preserves_outputs_gradients_and_parameter_names():
         )
     assert tuple(name for name, _ in optimized.encoder.named_parameters()) == parameter_names
     assert optimized._disentangled_flash_mode == "training"
+
+
+_MIXED_LENGTH_TEXTS = [
+    "apple acquired microsoft in nyc .",
+    "elon musk founded spacex .",
+    "apple .",
+    "microsoft in nyc acquired apple and elon musk founded spacex in nyc .",
+]
+
+
+@pytest.mark.parametrize("architecture", ["span", "boundary"])
+@pytest.mark.parametrize("packed", [True, "auto"])
+def test_packed_extraction_matches_padded(architecture, packed):
+    baseline = _build_extractor(architecture).eval()
+    optimized = copy.deepcopy(baseline).eval()
+    optimized.enable_disentangled_flash(
+        backend="torch",
+        packed=packed,
+        packed_min_padding=0.1,
+    )
+    labels = ["person", "organization", "location"]
+    options = {
+        "batch_size": 4,
+        "threshold": 0.1,
+        "include_confidence": True,
+        "include_spans": True,
+    }
+    with torch.inference_mode():
+        expected = baseline.batch_extract_entities(_MIXED_LENGTH_TEXTS, labels, **options)
+        actual = optimized.batch_extract_entities(_MIXED_LENGTH_TEXTS, labels, **options)
+
+    assert optimized._disentangled_flash_batches["packed"] >= 1
+    for expected_row, actual_row in zip(expected, actual, strict=True):
+        for label in labels:
+            expected_entities = expected_row["entities"][label]
+            actual_entities = actual_row["entities"][label]
+            assert [(e["text"], e["start"], e["end"]) for e in actual_entities] == [
+                (e["text"], e["start"], e["end"]) for e in expected_entities
+            ]
+            for e, a in zip(expected_entities, actual_entities, strict=True):
+                assert a["confidence"] == pytest.approx(e["confidence"], abs=1e-5)
+
+
+def test_packed_encoder_matches_padded_on_real_tokens():
+    baseline = _build_extractor("span").eval()
+    optimized = copy.deepcopy(baseline).eval()
+    optimized.enable_disentangled_flash(backend="torch", packed=True)
+    input_ids = torch.randint(0, baseline.encoder.config.vocab_size, (3, 12))
+    attention_mask = torch.ones_like(input_ids)
+    attention_mask[1, 7:] = 0
+    attention_mask[2, 3:] = 0
+
+    with torch.inference_mode():
+        expected = baseline.encoder(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).last_hidden_state
+        actual = optimized.encoder(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).last_hidden_state
+
+    real = attention_mask.bool()
+    torch.testing.assert_close(actual[real], expected[real], rtol=1e-5, atol=1e-6)
+    assert torch.count_nonzero(actual[~real]) == 0
+    assert optimized._disentangled_flash_batches == {"packed": 1, "padded": 0}
+
+
+def test_packed_training_matches_padded_gradients():
+    baseline = _build_extractor("span").train()
+    optimized = copy.deepcopy(baseline).train()
+    optimized.enable_disentangled_flash(backend="torch", inference=False, packed=True)
+    input_ids = torch.randint(0, baseline.encoder.config.vocab_size, (3, 12))
+    attention_mask = torch.ones_like(input_ids)
+    attention_mask[1, 7:] = 0
+    attention_mask[2, 3:] = 0
+    weight = attention_mask[..., None]
+
+    for model in (baseline, optimized):
+        hidden = model.encoder(
+            input_ids=input_ids, attention_mask=attention_mask
+        ).last_hidden_state
+        (hidden * weight).square().mean().backward()
+
+    baseline_parameters = dict(baseline.encoder.named_parameters())
+    for name, parameter in optimized.encoder.named_parameters():
+        expected_gradient = baseline_parameters[name].grad
+        assert expected_gradient is not None and parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, expected_gradient, rtol=1e-4, atol=1e-6)
+    assert optimized._disentangled_flash_batches == {"packed": 1, "padded": 0}

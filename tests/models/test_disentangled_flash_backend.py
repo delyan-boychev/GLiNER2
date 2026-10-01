@@ -12,6 +12,7 @@ from gliner2.models.base import BaseExtractorModel
 from gliner2.models.loading import (
     apply_post_load_options,
     pop_attention_backend,
+    pop_disentangled_flash_options,
     split_load_kwargs,
 )
 
@@ -60,6 +61,7 @@ def _install_fake_disentangled_flash(monkeypatch):
     calls = []
     module = types.ModuleType("disentangled_flash")
     module.DebertaV2OptimizedEncoder = FakeOptimizedEncoder
+    module.PackedSequenceInfo = tuple
 
     def enable_deberta_inference(
         model,
@@ -197,6 +199,7 @@ def test_training_mode_uses_differentiable_backend_without_hook(monkeypatch):
         model,
         backend="torch",
         inference=False,
+        packed=False,
     )
 
     assert result is model
@@ -222,8 +225,8 @@ def test_standard_load_option_enables_backend_after_device_and_precision(monkeyp
             events.append(("eval",))
             return self
 
-        def enable_disentangled_flash(self):
-            events.append(("disentangled_flash",))
+        def enable_disentangled_flash(self, **options):
+            events.append(("disentangled_flash", options))
             return self
 
     model = LoadableModel()
@@ -239,7 +242,7 @@ def test_standard_load_option_enables_backend_after_device_and_precision(monkeyp
         ("to", "cuda"),
         ("quantize",),
         ("eval",),
-        ("disentangled_flash",),
+        ("disentangled_flash", {}),
     ]
 
 
@@ -286,4 +289,117 @@ def test_unified_backend_rejects_conflicting_legacy_alias():
                 "attention_backend": "disentangled_flash",
                 "use_flashdeberta": True,
             }
+        )
+
+
+def _right_padded_mask(lengths, sequence_length):
+    positions = torch.arange(sequence_length)
+    return (positions[None, :] < torch.tensor(lengths)[:, None]).long()
+
+
+def test_packing_layout_auto_uses_padding_threshold():
+    layout = BaseExtractorModel._disentangled_flash_packing_layout
+    # 4 x 10 slots, 22 real tokens -> 45% padding.
+    mask = _right_padded_mask([10, 6, 4, 2], 10)
+
+    packed = layout(mask, "auto", 0.4)
+    assert packed is not None
+    boolean_mask, lengths = packed
+    assert lengths == (10, 6, 4, 2)
+    assert boolean_mask.dtype == torch.bool
+    assert layout(mask, "auto", 0.5) is None
+
+
+def test_packing_layout_auto_falls_back_for_unpackable_batches():
+    layout = BaseExtractorModel._disentangled_flash_packing_layout
+    left_padded = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]])
+    empty_row = _right_padded_mask([4, 0], 4)
+
+    assert layout(None, "auto", 0.0) is None
+    assert layout(left_padded, "auto", 0.0) is None
+    assert layout(empty_row, "auto", 0.0) is None
+
+
+def test_packing_layout_forced_packs_unpadded_batches_and_rejects_bad_ones():
+    layout = BaseExtractorModel._disentangled_flash_packing_layout
+    assert layout(_right_padded_mask([4, 4], 4), True, 0.9)[1] == (4, 4)
+    with pytest.raises(ValueError, match="right-padded"):
+        layout(torch.tensor([[0, 1], [1, 1]]), True, 0.0)
+    with pytest.raises(ValueError, match="attention_mask"):
+        layout(None, True, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("packed", "min_padding", "error"),
+    [
+        ("always", None, ValueError),
+        ("auto", 1.5, ValueError),
+        ("auto", "0.2", TypeError),
+        ("auto", True, TypeError),
+    ],
+)
+def test_enable_validates_packed_options(monkeypatch, packed, min_padding, error):
+    _install_fake_disentangled_flash(monkeypatch)
+    with pytest.raises(error):
+        BaseExtractorModel.enable_disentangled_flash(
+            FakeExtractor(),
+            packed=packed,
+            packed_min_padding=min_padding,
+        )
+
+
+def test_padded_batches_keep_prepared_plan_path(monkeypatch):
+    _install_fake_disentangled_flash(monkeypatch)
+    model = FakeExtractor()
+    BaseExtractorModel.enable_disentangled_flash(
+        model, backend="torch", packed_min_padding=0.5
+    )
+    optimized = model.encoder.encoder
+
+    with torch.inference_mode():
+        model.encoder(
+            input_ids=torch.ones((2, 8), dtype=torch.long),
+            attention_mask=_right_padded_mask([8, 6], 8),
+        )
+
+    assert optimized.prepare_calls == [(8,)]
+    assert model._disentangled_flash_batches == {"packed": 0, "padded": 1}
+
+
+def test_packed_load_options_are_forwarded_to_enable():
+    model_options, _ = split_load_kwargs(
+        {
+            "attention_backend": "disentangled_flash",
+            "disentangled_flash_packed": True,
+            "disentangled_flash_min_padding": 0.3,
+        }
+    )
+    options = pop_disentangled_flash_options(model_options)
+    assert options == {"packed": True, "packed_min_padding": 0.3}
+    assert model_options == {"attention_backend": "disentangled_flash"}
+
+    received = {}
+
+    class LoadableModel:
+        def eval(self):
+            return self
+
+        def enable_disentangled_flash(self, **kwargs):
+            received.update(kwargs)
+            return self
+
+    apply_post_load_options(
+        LoadableModel(),
+        attention_backend="disentangled_flash",
+        disentangled_flash_options=options,
+    )
+    assert received == {"packed": True, "packed_min_padding": 0.3}
+
+
+def test_packed_load_options_require_disentangled_flash_backend():
+    with pytest.raises(ValueError, match="require attention_backend"):
+        apply_post_load_options(
+            object(),
+            attention_backend="standard",
+            disentangled_flash_options={"packed": True},
         )

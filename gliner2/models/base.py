@@ -147,6 +147,10 @@ class BaseExtractorModel(PreTrainedModel):
     """
     config_class = ExtractorConfig
 
+    # Padding fraction at which packed="auto" switches to the packed path.
+    # Provisional until calibrated with benchmarks/benchmark_packed_threshold.py.
+    DISENTANGLED_FLASH_PACKED_MIN_PADDING = 0.25
+
     @staticmethod
     def _disentangled_flash_backend_for_device(device: torch.device) -> str:
         """Select Triton on NVIDIA CUDA and PyTorch everywhere else."""
@@ -160,11 +164,52 @@ class BaseExtractorModel(PreTrainedModel):
             f"device {device}."
         )
 
+    @staticmethod
+    def _disentangled_flash_packing_layout(
+        attention_mask: Optional[torch.Tensor],
+        packed: bool | str,
+        min_padding: float,
+    ) -> Optional[Tuple[torch.Tensor, Tuple[int, ...]]]:
+        """Decide whether a batch runs packed and return its unpadded layout.
+
+        Returns ``(boolean_mask, lengths)`` when the batch should run through
+        the packed path, or ``None`` to keep the padded path. ``packed=True``
+        requires a packable batch; ``"auto"`` falls back silently.
+        """
+        forced = packed is True
+
+        def reject(reason: str) -> None:
+            if forced:
+                raise ValueError(f"DisentangledFlash packed mode: {reason}")
+            return None
+
+        if attention_mask is None or attention_mask.ndim != 2:
+            return reject("requires a [B, L] attention_mask")
+        batch_size, sequence_length = attention_mask.shape
+        if batch_size == 0 or sequence_length == 0:
+            return reject("requires a non-empty batch")
+
+        mask = attention_mask.bool()
+        lengths_tensor = mask.sum(dim=1)
+        lengths = tuple(int(length) for length in lengths_tensor.tolist())
+        if min(lengths) <= 0:
+            return reject("empty sequences are unsupported")
+        padding = 1.0 - sum(lengths) / (batch_size * sequence_length)
+        if not forced and padding < min_padding:
+            return None
+
+        positions = torch.arange(sequence_length, device=mask.device)
+        if not torch.equal(mask, positions[None, :] < lengths_tensor[:, None]):
+            return reject("only right-padded batches can be packed")
+        return mask, lengths
+
     def enable_disentangled_flash(
         self,
         *,
         backend: str = "auto",
         inference: bool | None = None,
+        packed: bool | str = "auto",
+        packed_min_padding: float | None = None,
     ) -> "BaseExtractorModel":
         """Enable DisentangledFlash for DeBERTa-v2/v3 attention.
 
@@ -173,6 +218,11 @@ class BaseExtractorModel(PreTrainedModel):
         prepared lazily from GLiNER2's padded inputs and reused on later calls.
         Training mode keeps the attention parameters in the autograd graph and
         must be enabled before constructing the optimizer.
+
+        Batches with enough right padding can run through DisentangledFlash's
+        packed (unpadded, ``cu_seqlens``) path, which skips the padded tokens
+        in attention and in the feed-forward layers. Outputs at padded
+        positions are zero in that case.
 
         Move the model to its final device and dtype before enabling the
         backend. Call :meth:`eval` for inference or :meth:`train` for training.
@@ -183,10 +233,29 @@ class BaseExtractorModel(PreTrainedModel):
                 Pass ``"triton"`` or ``"torch"`` to request one explicitly.
             inference: Whether to install the prepared inference path. By
                 default, infer this from the model's current training state.
+            packed: ``"auto"`` packs a batch when its padding fraction is at
+                least ``packed_min_padding``; ``True`` packs every batch;
+                ``False`` always uses the padded path.
+            packed_min_padding: Padding fraction (padded tokens divided by
+                ``B * L``) at which ``"auto"`` switches to the packed path.
+                Defaults to :attr:`DISENTANGLED_FLASH_PACKED_MIN_PADDING`.
 
         Returns:
             The model itself, for method chaining.
         """
+        if packed not in (True, False, "auto"):
+            raise ValueError("packed must be True, False, or 'auto'")
+        if packed_min_padding is None:
+            packed_min_padding = (
+                BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_PADDING
+            )
+        if isinstance(packed_min_padding, bool) or not isinstance(
+            packed_min_padding, (int, float)
+        ):
+            raise TypeError("packed_min_padding must be a number")
+        packed_min_padding = float(packed_min_padding)
+        if not 0.0 <= packed_min_padding <= 1.0:
+            raise ValueError("packed_min_padding must be between 0 and 1")
         if inference is None:
             inference = not self.training
         if not isinstance(inference, bool):
@@ -282,10 +351,118 @@ class BaseExtractorModel(PreTrainedModel):
 
         self._disentangled_flash_backend = optimized_encoder.backend
         self._disentangled_flash_mode = requested_mode
+        self._disentangled_flash_packed = packed
+        self._disentangled_flash_packed_min_padding = packed_min_padding
+        self._disentangled_flash_batches = {"packed": 0, "padded": 0}
+
+        # Pending packed layout for the next encoder call, set by the
+        # backbone pre-hook and consumed by the encoder forward wrapper.
+        pending: dict = {}
+
+        def select_layout(module, args, kwargs) -> bool:
+            pending.clear()
+            if packed is False or kwargs.get("output_attentions"):
+                self._disentangled_flash_batches["padded"] += 1
+                return False
+            if inference and torch.is_grad_enabled():
+                if packed is True:
+                    raise RuntimeError(
+                        "DisentangledFlash packed inference requires "
+                        "torch.no_grad() or torch.inference_mode()."
+                    )
+                self._disentangled_flash_batches["padded"] += 1
+                return False
+            attention_mask = kwargs.get("attention_mask")
+            if attention_mask is None and len(args) > 1:
+                attention_mask = args[1]
+            layout = BaseExtractorModel._disentangled_flash_packing_layout(
+                attention_mask, packed, packed_min_padding
+            )
+            if layout is None:
+                self._disentangled_flash_batches["padded"] += 1
+                return False
+            output_hidden_states = kwargs.get("output_hidden_states")
+            if output_hidden_states is None:
+                output_hidden_states = module.config.output_hidden_states
+            pending["layout"] = layout
+            pending["all_hidden_states"] = bool(output_hidden_states)
+            self._disentangled_flash_batches["packed"] += 1
+            return True
+
+        if packed is not False:
+            from disentangled_flash import PackedSequenceInfo
+            from transformers.modeling_outputs import BaseModelOutput
+
+            padded_forward = optimized_encoder.forward
+
+            def forward(hidden_states, attention_mask, *args, **kwargs):
+                layout = pending.pop("layout", None)
+                if layout is None:
+                    return padded_forward(
+                        hidden_states, attention_mask, *args, **kwargs
+                    )
+                mask, lengths = layout
+                if mask.shape != hidden_states.shape[:2]:
+                    raise RuntimeError(
+                        "DisentangledFlash packed layout does not match the "
+                        "encoder input."
+                    )
+                offsets = [0]
+                for length in lengths:
+                    offsets.append(offsets[-1] + length)
+                info = PackedSequenceInfo(tuple(offsets), lengths, max(lengths))
+                cu_seqlens = torch.tensor(
+                    offsets, dtype=torch.int32, device=hidden_states.device
+                )
+                outputs = optimized_encoder.forward_packed(
+                    hidden_states[mask],
+                    cu_seqlens,
+                    info.max_seqlen,
+                    output_hidden_states=pending.pop("all_hidden_states"),
+                    return_dict=True,
+                    packed_info=info,
+                )
+
+                def unpack(states: torch.Tensor) -> torch.Tensor:
+                    padded = states.new_zeros(
+                        (*mask.shape, *states.shape[1:])
+                    )
+                    padded[mask] = states
+                    return padded
+
+                last_hidden_state = unpack(outputs.last_hidden_state)
+                if outputs.hidden_states is None:
+                    # DebertaV2Model reads encoder_outputs[1][-1].
+                    all_hidden_states = (last_hidden_state,)
+                else:
+                    all_hidden_states = tuple(
+                        unpack(states) for states in outputs.hidden_states[:-1]
+                    ) + (last_hidden_state,)
+                if not kwargs.get("return_dict", True):
+                    return (last_hidden_state, all_hidden_states)
+                return BaseModelOutput(
+                    last_hidden_state=last_hidden_state,
+                    hidden_states=all_hidden_states,
+                    attentions=None,
+                )
+
+            optimized_encoder.forward = forward
+
         if not inference:
+            if packed is not False:
+                def select_training_layout(module, args, kwargs):
+                    select_layout(module, args, kwargs)
+
+                self._disentangled_flash_hook_handle = (
+                    self.encoder.register_forward_pre_hook(
+                        select_training_layout,
+                        with_kwargs=True,
+                    )
+                )
             logger.info(
-                "Enabled DisentangledFlash training backend %s",
+                "Enabled DisentangledFlash training backend %s (packed=%s)",
                 optimized_encoder.backend,
+                packed,
             )
             return self
 
@@ -325,6 +502,9 @@ class BaseExtractorModel(PreTrainedModel):
                     "DisentangledFlash requires input_ids with shape [B, L] "
                     "to select a prepared sequence-length plan."
                 )
+
+            if select_layout(module, args, kwargs):
+                return
 
             sequence_length = int(input_ids.shape[1])
             prepared_lengths = tuple(

@@ -35,6 +35,8 @@ MODEL_LOAD_OPTIONS = frozenset(
         "attention_backend",
         "quantize",
         "compile",
+        "disentangled_flash_min_padding",
+        "disentangled_flash_packed",
         "map_location",
         "use_flashdeberta",
         "word_splitter",
@@ -96,6 +98,20 @@ def pop_attention_backend(
             )
 
     return backend, backend == "flashdeberta"
+
+
+def pop_disentangled_flash_options(
+    model_options: MutableMapping[str, Any],
+) -> Dict[str, Any]:
+    """Collect DisentangledFlash load options as enable_disentangled_flash kwargs."""
+    options = {}
+    if "disentangled_flash_packed" in model_options:
+        options["packed"] = model_options.pop("disentangled_flash_packed")
+    if "disentangled_flash_min_padding" in model_options:
+        options["packed_min_padding"] = model_options.pop(
+            "disentangled_flash_min_padding"
+        )
+    return options
 
 
 def checkpoint_file(
@@ -212,8 +228,13 @@ def apply_post_load_options(
     compile_model: bool = False,
     compile_dynamic: bool | None = None,
     attention_backend: str | None = None,
+    disentangled_flash_options: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Apply device, precision, attention, then compilation options."""
+    """Apply device, precision, attention, then compilation options.
+
+    Selecting ``attention_backend="disentangled_flash"`` switches the model to
+    eval mode before installing the inference backend.
+    """
     if not isinstance(quantize, bool):
         raise TypeError(f"quantize must be a bool, got {type(quantize).__name__}")
     if not isinstance(compile_model, bool):
@@ -226,6 +247,11 @@ def apply_post_load_options(
             "be enabled together; "
             "DisentangledFlash manages its own prepared attention path."
         )
+    if disentangled_flash_options and attention_backend != "disentangled_flash":
+        raise ValueError(
+            "disentangled_flash_packed and disentangled_flash_min_padding "
+            "require attention_backend='disentangled_flash'."
+        )
 
     if map_location is not None:
         model = model.to(map_location)
@@ -233,7 +259,7 @@ def apply_post_load_options(
         model.quantize()
     if attention_backend == "disentangled_flash":
         model.eval()
-        model.enable_disentangled_flash()
+        model.enable_disentangled_flash(**(disentangled_flash_options or {}))
     if compile_model:
         if compile_dynamic is None:
             model.compile()
