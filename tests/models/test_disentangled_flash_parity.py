@@ -148,6 +148,7 @@ def test_packed_extraction_matches_padded(architecture, packed):
         backend="torch",
         packed=packed,
         packed_min_padding=0.1,
+        packed_min_work=0,
     )
     labels = ["person", "organization", "location"]
     options = {

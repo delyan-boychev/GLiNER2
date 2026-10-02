@@ -36,6 +36,7 @@ MODEL_LOAD_OPTIONS = frozenset(
         "quantize",
         "compile",
         "disentangled_flash_min_padding",
+        "disentangled_flash_min_work",
         "disentangled_flash_packed",
         "disentangled_flash_tuning",
         "map_location",
@@ -104,7 +105,7 @@ def pop_attention_backend(
 def pop_disentangled_flash_options(
     model_options: MutableMapping[str, Any],
 ) -> Dict[str, Any]:
-    """Collect DisentangledFlash load options as enable_disentangled_flash kwargs."""
+    """Map ``disentangled_flash_*`` load options to enable kwargs."""
     options = {}
     if "disentangled_flash_packed" in model_options:
         options["packed"] = model_options.pop("disentangled_flash_packed")
@@ -112,6 +113,8 @@ def pop_disentangled_flash_options(
         options["packed_min_padding"] = model_options.pop(
             "disentangled_flash_min_padding"
         )
+    if "disentangled_flash_min_work" in model_options:
+        options["packed_min_work"] = model_options.pop("disentangled_flash_min_work")
     if "disentangled_flash_tuning" in model_options:
         options["tuning"] = model_options.pop("disentangled_flash_tuning")
     return options
@@ -233,11 +236,7 @@ def apply_post_load_options(
     attention_backend: str | None = None,
     disentangled_flash_options: Mapping[str, Any] | None = None,
 ) -> Any:
-    """Apply device, precision, attention, then compilation options.
-
-    Selecting ``attention_backend="disentangled_flash"`` switches the model to
-    eval mode before installing the inference backend.
-    """
+    """Apply device, precision, attention, then compilation options."""
     if not isinstance(quantize, bool):
         raise TypeError(f"quantize must be a bool, got {type(quantize).__name__}")
     if not isinstance(compile_model, bool):
@@ -252,8 +251,9 @@ def apply_post_load_options(
         )
     if disentangled_flash_options and attention_backend != "disentangled_flash":
         raise ValueError(
-            "disentangled_flash_packed, disentangled_flash_min_padding and "
-            "disentangled_flash_tuning require attention_backend='disentangled_flash'."
+            "disentangled_flash_packed, disentangled_flash_min_padding, "
+            "disentangled_flash_min_work and disentangled_flash_tuning "
+            "require attention_backend='disentangled_flash'."
         )
 
     if map_location is not None:

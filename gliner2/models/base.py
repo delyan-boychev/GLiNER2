@@ -147,9 +147,10 @@ class BaseExtractorModel(PreTrainedModel):
     """
     config_class = ExtractorConfig
 
-    # Padding fraction at which packed="auto" switches to the packed path.
-    # Provisional until calibrated with benchmarks/benchmark_packed_threshold.py.
-    DISENTANGLED_FLASH_PACKED_MIN_PADDING = 0.25
+    # packed="auto" thresholds, measured on an H200 with
+    # benchmarks/benchmark_packed_threshold.py.
+    DISENTANGLED_FLASH_PACKED_MIN_PADDING = 0.15
+    DISENTANGLED_FLASH_PACKED_MIN_WORK = 2**21  # B * L**2
 
     @staticmethod
     def _disentangled_flash_backend_for_device(device: torch.device) -> str:
@@ -169,13 +170,9 @@ class BaseExtractorModel(PreTrainedModel):
         attention_mask: Optional[torch.Tensor],
         packed: bool | str,
         min_padding: float,
+        min_work: int = 0,
     ) -> Optional[Tuple[torch.Tensor, Tuple[int, ...]]]:
-        """Decide whether a batch runs packed and return its unpadded layout.
-
-        Returns ``(boolean_mask, lengths)`` when the batch should run through
-        the packed path, or ``None`` to keep the padded path. ``packed=True``
-        requires a packable batch; ``"auto"`` falls back silently.
-        """
+        """Return ``(mask, lengths)`` to run the batch packed, else ``None``."""
         forced = packed is True
 
         def reject(reason: str) -> None:
@@ -188,6 +185,8 @@ class BaseExtractorModel(PreTrainedModel):
         batch_size, sequence_length = attention_mask.shape
         if batch_size == 0 or sequence_length == 0:
             return reject("requires a non-empty batch")
+        if not forced and batch_size * sequence_length**2 < min_work:
+            return None
 
         mask = attention_mask.bool()
         lengths_tensor = mask.sum(dim=1)
@@ -210,44 +209,25 @@ class BaseExtractorModel(PreTrainedModel):
         inference: bool | None = None,
         packed: bool | str = "auto",
         packed_min_padding: float | None = None,
+        packed_min_work: int | None = None,
         tuning: Any = None,
     ) -> "BaseExtractorModel":
         """Enable DisentangledFlash for DeBERTa-v2/v3 attention.
 
-        The loaded Hugging Face backbone is optimized in place while retaining
-        its parameter names. In inference mode, sequence-length plans are
-        prepared lazily from GLiNER2's padded inputs and reused on later calls.
-        Training mode keeps the attention parameters in the autograd graph and
-        must be enabled before constructing the optimizer.
-
-        Batches with enough right padding can run through DisentangledFlash's
-        packed (unpadded, ``cu_seqlens``) path, which skips the padded tokens
-        in attention and in the feed-forward layers. Outputs at padded
-        positions are zero in that case.
-
-        Move the model to its final device and dtype before enabling the
-        backend. Call :meth:`eval` for inference or :meth:`train` for training.
+        Move the model to its final device and dtype first. For training, call
+        it after :meth:`train` and before building the optimizer. Packed
+        batches return zeros at padded positions.
 
         Args:
-            backend: ``"auto"`` selects Triton for supported NVIDIA CUDA
-                models and the optimized PyTorch implementation otherwise.
-                Pass ``"triton"`` or ``"torch"`` to request one explicitly.
-            inference: Whether to install the prepared inference path. By
-                default, infer this from the model's current training state.
-            packed: ``"auto"`` packs a batch when its padding fraction is at
-                least ``packed_min_padding``; ``True`` packs every batch;
-                ``False`` always uses the padded path.
-            packed_min_padding: Padding fraction (padded tokens divided by
-                ``B * L``) at which ``"auto"`` switches to the packed path.
-                Defaults to :attr:`DISENTANGLED_FLASH_PACKED_MIN_PADDING`.
-            tuning: Triton launch-config selection. ``None`` keeps the
-                DisentangledFlash default (a matching saved profile, else the
-                heuristic). Pass a mode name (``"auto"``, ``"heuristic"``,
-                ``"autotune"`` or ``"profile_only"``) or a
-                ``disentangled_flash.KernelTuningOptions``.
-
-        Returns:
-            The model itself, for method chaining.
+            backend: ``"auto"``, ``"triton"`` or ``"torch"``. ``"auto"`` uses
+                Triton on NVIDIA CUDA and PyTorch elsewhere.
+            inference: Defaults to ``not self.training``.
+            packed: ``"auto"`` packs when both thresholds below are met,
+                ``True`` always packs, ``False`` never does.
+            packed_min_padding: Minimum padded fraction of ``B * L``.
+            packed_min_work: Minimum ``B * L**2``.
+            tuning: Kernel tuning mode name or ``KernelTuningOptions``;
+                ``None`` keeps the DisentangledFlash default.
         """
         if packed not in (True, False, "auto"):
             raise ValueError("packed must be True, False, or 'auto'")
@@ -262,6 +242,12 @@ class BaseExtractorModel(PreTrainedModel):
         packed_min_padding = float(packed_min_padding)
         if not 0.0 <= packed_min_padding <= 1.0:
             raise ValueError("packed_min_padding must be between 0 and 1")
+        if packed_min_work is None:
+            packed_min_work = BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_WORK
+        if isinstance(packed_min_work, bool) or not isinstance(packed_min_work, int):
+            raise TypeError("packed_min_work must be an int")
+        if packed_min_work < 0:
+            raise ValueError("packed_min_work must be non-negative")
         if inference is None:
             inference = not self.training
         if not isinstance(inference, bool):
@@ -368,10 +354,10 @@ class BaseExtractorModel(PreTrainedModel):
         self._disentangled_flash_mode = requested_mode
         self._disentangled_flash_packed = packed
         self._disentangled_flash_packed_min_padding = packed_min_padding
+        self._disentangled_flash_packed_min_work = packed_min_work
         self._disentangled_flash_batches = {"packed": 0, "padded": 0}
 
-        # Pending packed layout for the next encoder call, set by the
-        # backbone pre-hook and consumed by the encoder forward wrapper.
+        # Set by the backbone pre-hook, consumed by the encoder forward.
         pending: dict = {}
 
         def select_layout(module, args, kwargs) -> bool:
@@ -391,7 +377,7 @@ class BaseExtractorModel(PreTrainedModel):
             if attention_mask is None and len(args) > 1:
                 attention_mask = args[1]
             layout = BaseExtractorModel._disentangled_flash_packing_layout(
-                attention_mask, packed, packed_min_padding
+                attention_mask, packed, packed_min_padding, packed_min_work
             )
             if layout is None:
                 self._disentangled_flash_batches["padded"] += 1

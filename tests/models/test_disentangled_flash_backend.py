@@ -381,6 +381,7 @@ def test_packed_load_options_are_forwarded_to_enable():
             "attention_backend": "disentangled_flash",
             "disentangled_flash_packed": True,
             "disentangled_flash_min_padding": 0.3,
+            "disentangled_flash_min_work": 2**20,
             "disentangled_flash_tuning": "heuristic",
         }
     )
@@ -388,6 +389,7 @@ def test_packed_load_options_are_forwarded_to_enable():
     assert options == {
         "packed": True,
         "packed_min_padding": 0.3,
+        "packed_min_work": 2**20,
         "tuning": "heuristic",
     }
     assert model_options == {"attention_backend": "disentangled_flash"}
@@ -429,3 +431,38 @@ def test_tuning_rejects_unknown_type(monkeypatch):
     _install_fake_disentangled_flash(monkeypatch)
     with pytest.raises(TypeError, match="tuning must be"):
         BaseExtractorModel.enable_disentangled_flash(FakeExtractor(), tuning=3)
+
+
+def test_packing_layout_auto_requires_enough_attention_work():
+    layout = BaseExtractorModel._disentangled_flash_packing_layout
+    mask = _right_padded_mask([10, 6, 4, 2], 10)  # B * L**2 = 400
+
+    assert layout(mask, "auto", 0.4, min_work=400) is not None
+    assert layout(mask, "auto", 0.4, min_work=401) is None
+    # Forced packing ignores both thresholds.
+    assert layout(mask, True, 0.9, min_work=10**9) is not None
+
+
+def test_default_packing_thresholds_match_measured_break_even():
+    assert BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_PADDING == 0.15
+    assert BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_WORK == 2**21
+    layout = BaseExtractorModel._disentangled_flash_packing_layout
+    defaults = (
+        BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_PADDING,
+        BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_WORK,
+    )
+    # 16 x 256 never paid off on the H200, even at 70% padding.
+    small = _right_padded_mask([256] + [40] * 15, 256)
+    assert layout(small, "auto", *defaults) is None
+    # 8 x 512 paid off from 15% padding.
+    large = _right_padded_mask([512] * 4 + [300] * 4, 512)
+    assert layout(large, "auto", *defaults) is not None
+
+
+@pytest.mark.parametrize(("min_work", "error"), [(-1, ValueError), (1.5, TypeError)])
+def test_enable_validates_packed_min_work(monkeypatch, min_work, error):
+    _install_fake_disentangled_flash(monkeypatch)
+    with pytest.raises(error):
+        BaseExtractorModel.enable_disentangled_flash(
+            FakeExtractor(), packed_min_work=min_work
+        )

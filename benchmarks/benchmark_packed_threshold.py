@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
-"""
-Calibrate the DisentangledFlash packed-layout threshold for GLiNER2.
-
-For a grid of batch sizes, padded lengths and padding fractions, this times
-the DeBERTa backbone with the padded path (packed=False) and the packed path
-(packed=True) on identical weights and inputs, then reports the smallest
-padding fraction at which packing is faster. The suggested threshold is the
-value to use for ``packed_min_padding`` (or
-``BaseExtractorModel.DISENTANGLED_FLASH_PACKED_MIN_PADDING``).
+"""Measure when DisentangledFlash's packed layout beats the padded one.
 
 Usage:
-  python benchmarks/benchmark_packed_threshold.py
-  python benchmarks/benchmark_packed_threshold.py --dtype bf16 --batch-sizes 8 32 \\
-      --lengths 128 256 512 --paddings 0 0.05 0.1 0.2 0.3 0.5
-  python benchmarks/benchmark_packed_threshold.py --output packed_threshold.json
+  python benchmarks/benchmark_packed_threshold.py --dtype fp16 --output packed_fp16.json
 """
 
 from __future__ import annotations
@@ -32,7 +21,7 @@ DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def lengths_for_padding(batch_size: int, max_length: int, padding: float) -> list[int]:
-    """Right-padded row lengths with one full row and the target padding fraction."""
+    """Row lengths for a right-padded batch with the given padding fraction."""
     if batch_size == 1:
         return [max_length]
     rows = batch_size - 1
@@ -40,7 +29,6 @@ def lengths_for_padding(batch_size: int, max_length: int, padding: float) -> lis
     remaining = min(max(real_tokens - max_length, rows), rows * max_length)
     base, extra = divmod(remaining, rows)
     lengths = [base + (1 if index < extra else 0) for index in range(rows)]
-    # Shift tokens between row pairs so lengths vary while the total is unchanged.
     for index in range(0, rows - 1, 2):
         shift = min(lengths[index] - 1, max_length - lengths[index + 1]) // 2
         lengths[index] -= shift
@@ -74,7 +62,7 @@ def time_encoder(encoder, input_ids, attention_mask, warmup: int, measure: int) 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default="fastino/gliner2-base-v1")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default=None,
@@ -155,13 +143,24 @@ def main() -> None:
             label = f"{value:.2f}" if value is not None else "never in range"
             print(f"  B={batch_size:<4} L={max_length:<5} {label}")
 
-    measured = [value for value in break_even.values()]
-    if measured:
-        suggested = max(measured)
-        print(f"\nSuggested packed_min_padding (conservative, max break-even): {suggested:.2f}")
-        print(f"Median break-even: {statistics.median(measured):.2f}")
+    if break_even:
+        suggested = max(break_even.values())
+        work = {key: key[0] * key[1] ** 2 for key in break_even}
+        suggested_work = min(work.values())
+        never = sorted(
+            (batch_size, max_length)
+            for batch_size in args.batch_sizes
+            for max_length in args.lengths
+            if (batch_size, max_length) not in break_even
+            and batch_size * max_length**2 >= suggested_work
+            and max_length <= max_positions
+        )
+        print(f"\nSuggested packed_min_padding (max break-even): {suggested:.2f}")
+        print(f"Suggested packed_min_work (smallest B*L^2 that broke even): {suggested_work}")
+        if never:
+            print(f"  Note: {never} reach that work but never broke even.")
     else:
-        suggested = None
+        suggested = suggested_work = None
         print("\nPacked was never faster in the measured range; keep packed=False.")
 
     if args.output:
@@ -175,6 +174,7 @@ def main() -> None:
                 "tuning_mode": args.tuning_mode,
                 "results": results,
                 "suggested_min_padding": suggested,
+                "suggested_min_work": suggested_work,
             }, handle, indent=2)
 
 

@@ -1140,22 +1140,28 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
 ```
 
 Batches that mix short and long inputs carry right padding. By default
-(`packed="auto"`), a batch whose padding fraction reaches `packed_min_padding`
-runs through DisentangledFlash's packed (unpadded) layout, which skips padded
-tokens in attention and in the feed-forward layers. Set the behavior when
-loading:
+(`packed="auto"`), a batch runs through DisentangledFlash's packed (unpadded)
+layout, which skips padded tokens in attention and in the feed-forward layers,
+when at least 15% of it is padding and its attention work `B × L²` is at least
+2²¹ (for example 8 × 512 or 32 × 256). Below that the GPU is not saturated, so
+padding is nearly free and packing's overhead does not pay off. These defaults
+were measured on an H200; override them when loading:
 
 ```python
 model = AutoExtractor.from_pretrained(
     "fastino/gliner2.5-base-v1",
     map_location="cuda",
     attention_backend="disentangled_flash",
-    disentangled_flash_packed="auto",       # "auto", True, or False
-    disentangled_flash_min_padding=0.25,    # padding fraction that triggers packing
+    disentangled_flash_packed="auto",        # "auto", True, or False
+    disentangled_flash_min_padding=0.15,     # padding fraction required to pack
+    disentangled_flash_min_work=2**21,       # B * L**2 required to pack
 )
 ```
 
-or with `model.enable_disentangled_flash(packed=..., packed_min_padding=...)`.
+or with `model.enable_disentangled_flash(packed=..., packed_min_padding=...,
+packed_min_work=...)`. `benchmarks/benchmark_packed_threshold.py` measures both
+thresholds on your hardware.
+
 Kernel launch configs follow DisentangledFlash's default (a matching tuning
 profile, otherwise its heuristic); pass `disentangled_flash_tuning="heuristic"`
 (or `tuning=` on `enable_disentangled_flash`) to always use the heuristic.
