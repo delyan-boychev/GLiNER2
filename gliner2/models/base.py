@@ -14,7 +14,7 @@ import logging
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -210,6 +210,7 @@ class BaseExtractorModel(PreTrainedModel):
         inference: bool | None = None,
         packed: bool | str = "auto",
         packed_min_padding: float | None = None,
+        tuning: Any = None,
     ) -> "BaseExtractorModel":
         """Enable DisentangledFlash for DeBERTa-v2/v3 attention.
 
@@ -239,6 +240,11 @@ class BaseExtractorModel(PreTrainedModel):
             packed_min_padding: Padding fraction (padded tokens divided by
                 ``B * L``) at which ``"auto"`` switches to the packed path.
                 Defaults to :attr:`DISENTANGLED_FLASH_PACKED_MIN_PADDING`.
+            tuning: Triton launch-config selection. ``None`` keeps the
+                DisentangledFlash default (a matching saved profile, else the
+                heuristic). Pass a mode name (``"auto"``, ``"heuristic"``,
+                ``"autotune"`` or ``"profile_only"``) or a
+                ``disentangled_flash.KernelTuningOptions``.
 
         Returns:
             The model itself, for method chaining.
@@ -288,6 +294,7 @@ class BaseExtractorModel(PreTrainedModel):
         try:
             from disentangled_flash import (
                 DebertaV2OptimizedEncoder,
+                KernelTuningOptions,
                 optimize_deberta,
             )
         except ImportError as error:
@@ -295,6 +302,13 @@ class BaseExtractorModel(PreTrainedModel):
                 "DisentangledFlash is optional; install it with "
                 "'pip install gliner2[disentangled-flash]'."
             ) from error
+
+        if isinstance(tuning, str):
+            tuning = KernelTuningOptions(mode=tuning)
+        elif tuning is not None and not isinstance(tuning, KernelTuningOptions):
+            raise TypeError(
+                "tuning must be None, a mode name, or KernelTuningOptions"
+            )
 
         existing_mode = getattr(self, "_disentangled_flash_mode", None)
         requested_mode = "inference" if inference else "training"
@@ -341,6 +355,7 @@ class BaseExtractorModel(PreTrainedModel):
             inference=inference,
             sequence_lengths=None,
             fp32_precision="strict",
+            tuning=tuning,
         )
         optimized_encoder = self.encoder.encoder
         if not isinstance(optimized_encoder, DebertaV2OptimizedEncoder):

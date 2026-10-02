@@ -37,6 +37,7 @@ MODEL_LOAD_OPTIONS = frozenset(
         "compile",
         "disentangled_flash_min_padding",
         "disentangled_flash_packed",
+        "disentangled_flash_tuning",
         "map_location",
         "use_flashdeberta",
         "word_splitter",
@@ -111,6 +112,8 @@ def pop_disentangled_flash_options(
         options["packed_min_padding"] = model_options.pop(
             "disentangled_flash_min_padding"
         )
+    if "disentangled_flash_tuning" in model_options:
+        options["tuning"] = model_options.pop("disentangled_flash_tuning")
     return options
 
 
@@ -249,8 +252,8 @@ def apply_post_load_options(
         )
     if disentangled_flash_options and attention_backend != "disentangled_flash":
         raise ValueError(
-            "disentangled_flash_packed and disentangled_flash_min_padding "
-            "require attention_backend='disentangled_flash'."
+            "disentangled_flash_packed, disentangled_flash_min_padding and "
+            "disentangled_flash_tuning require attention_backend='disentangled_flash'."
         )
 
     if map_location is not None:

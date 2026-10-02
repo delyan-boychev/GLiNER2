@@ -1156,6 +1156,9 @@ model = AutoExtractor.from_pretrained(
 ```
 
 or with `model.enable_disentangled_flash(packed=..., packed_min_padding=...)`.
+Kernel launch configs follow DisentangledFlash's default (a matching tuning
+profile, otherwise its heuristic); pass `disentangled_flash_tuning="heuristic"`
+(or `tuning=` on `enable_disentangled_flash`) to always use the heuristic.
 `benchmarks/benchmark_packed_threshold.py` measures the break-even padding on
 your hardware.
 

@@ -63,6 +63,12 @@ def _install_fake_disentangled_flash(monkeypatch):
     module.DebertaV2OptimizedEncoder = FakeOptimizedEncoder
     module.PackedSequenceInfo = tuple
 
+    class KernelTuningOptions:
+        def __init__(self, mode="auto"):
+            self.mode = mode
+
+    module.KernelTuningOptions = KernelTuningOptions
+
     def enable_deberta_inference(
         model,
         *,
@@ -70,6 +76,7 @@ def _install_fake_disentangled_flash(monkeypatch):
         inference=True,
         sequence_lengths=None,
         fp32_precision="strict",
+        tuning=None,
     ):
         selected_backend = "torch" if backend == "auto" else backend
         calls.append(
@@ -79,6 +86,7 @@ def _install_fake_disentangled_flash(monkeypatch):
                 "inference": inference,
                 "sequence_lengths": sequence_lengths,
                 "fp32_precision": fp32_precision,
+                "tuning": tuning,
             }
         )
         model.encoder = FakeOptimizedEncoder(selected_backend)
@@ -159,6 +167,7 @@ def test_enable_installs_backend_and_is_idempotent(monkeypatch):
             "inference": True,
             "sequence_lengths": None,
             "fp32_precision": "strict",
+            "tuning": None,
         }
     ]
     assert model._disentangled_flash_backend == "torch"
@@ -372,10 +381,15 @@ def test_packed_load_options_are_forwarded_to_enable():
             "attention_backend": "disentangled_flash",
             "disentangled_flash_packed": True,
             "disentangled_flash_min_padding": 0.3,
+            "disentangled_flash_tuning": "heuristic",
         }
     )
     options = pop_disentangled_flash_options(model_options)
-    assert options == {"packed": True, "packed_min_padding": 0.3}
+    assert options == {
+        "packed": True,
+        "packed_min_padding": 0.3,
+        "tuning": "heuristic",
+    }
     assert model_options == {"attention_backend": "disentangled_flash"}
 
     received = {}
@@ -393,7 +407,7 @@ def test_packed_load_options_are_forwarded_to_enable():
         attention_backend="disentangled_flash",
         disentangled_flash_options=options,
     )
-    assert received == {"packed": True, "packed_min_padding": 0.3}
+    assert received == options
 
 
 def test_packed_load_options_require_disentangled_flash_backend():
@@ -403,3 +417,15 @@ def test_packed_load_options_require_disentangled_flash_backend():
             attention_backend="standard",
             disentangled_flash_options={"packed": True},
         )
+
+
+def test_tuning_mode_name_is_forwarded(monkeypatch):
+    calls = _install_fake_disentangled_flash(monkeypatch)
+    BaseExtractorModel.enable_disentangled_flash(FakeExtractor(), tuning="heuristic")
+    assert calls[0]["tuning"].mode == "heuristic"
+
+
+def test_tuning_rejects_unknown_type(monkeypatch):
+    _install_fake_disentangled_flash(monkeypatch)
+    with pytest.raises(TypeError, match="tuning must be"):
+        BaseExtractorModel.enable_disentangled_flash(FakeExtractor(), tuning=3)

@@ -80,6 +80,9 @@ def main() -> None:
     parser.add_argument("--dtype", choices=sorted(DTYPES), default=None,
                         help="Default: fp16 on CUDA, fp32 otherwise")
     parser.add_argument("--backend", choices=["auto", "torch", "triton"], default="auto")
+    parser.add_argument("--tuning-mode", choices=["auto", "heuristic", "autotune"],
+                        default="heuristic",
+                        help="Triton launch-config selection (default: heuristic)")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 8, 16, 32])
     parser.add_argument("--lengths", type=int, nargs="+", default=[64, 128, 256, 512])
     parser.add_argument("--paddings", type=float, nargs="+",
@@ -97,17 +100,17 @@ def main() -> None:
         model = model.to(DTYPES[dtype_name])
 
     padded = copy.deepcopy(model).eval().enable_disentangled_flash(
-        backend=args.backend, packed=False
+        backend=args.backend, packed=False, tuning=args.tuning_mode
     )
     packed = copy.deepcopy(model).eval().enable_disentangled_flash(
-        backend=args.backend, packed=True
+        backend=args.backend, packed=True, tuning=args.tuning_mode
     )
     del model
     vocab_size = padded.encoder.config.vocab_size
     max_positions = padded.encoder.config.max_position_embeddings
 
     print(f"model={args.model} device={args.device} dtype={dtype_name} "
-          f"backend={padded._disentangled_flash_backend}")
+          f"backend={padded._disentangled_flash_backend} tuning={args.tuning_mode}")
     if args.device.startswith("cuda"):
         print(f"gpu={torch.cuda.get_device_name()}")
     print(f"{'B':>4} {'L':>5} {'pad':>6} {'padded ms':>10} {'packed ms':>10} {'speedup':>8}")
@@ -169,6 +172,7 @@ def main() -> None:
                 "gpu": torch.cuda.get_device_name() if args.device.startswith("cuda") else None,
                 "dtype": dtype_name,
                 "backend": padded._disentangled_flash_backend,
+                "tuning_mode": args.tuning_mode,
                 "results": results,
                 "suggested_min_padding": suggested,
             }, handle, indent=2)
