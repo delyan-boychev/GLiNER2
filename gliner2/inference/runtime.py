@@ -459,18 +459,12 @@ class ExtractorRuntimeMixin:
             batch,
         )
 
-        span_samples = []
-        for i in range(len(batch)):
-            has_span = any(t != "classifications" for t in batch.task_types[i])
-            if has_span and all_token_embs[i].numel() > 0:
-                span_samples.append(i)
-
-        all_span_info = [None] * len(batch)
-        if span_samples:
-            span_embs = [all_token_embs[i] for i in span_samples]
-            span_results = self.compute_span_rep_batched(span_embs)
-            for idx, si in zip(span_samples, span_results):
-                all_span_info[idx] = si
+        # Build every span task's count-aware query vectors first, concatenate
+        # them per sample, then run one factorized span-scoring pass per model
+        # batch.  Classification tasks do not participate in span scoring.
+        all_raw_logits, all_pred_counts = self._compute_direct_span_logits_batched(
+            batch, all_token_embs, all_schema_embs
+        )
 
         if (
             batch.input_ids.device.type in ("cuda", "mps")
@@ -480,7 +474,8 @@ class ExtractorRuntimeMixin:
             return self._extract_from_batch_sync_collapsed(
                 batch=batch,
                 all_schema_embs=all_schema_embs,
-                all_span_info=all_span_info,
+                all_raw_logits=all_raw_logits,
+                all_pred_counts=all_pred_counts,
                 threshold=threshold,
                 metadata_list=metadata_list,
                 include_confidence=include_confidence,
@@ -488,7 +483,6 @@ class ExtractorRuntimeMixin:
             )
 
         results = []
-
         for i in range(len(batch)):
             try:
                 sample_result = self._extract_sample(
@@ -505,7 +499,8 @@ class ExtractorRuntimeMixin:
                     metadata=metadata_list[i],
                     include_confidence=include_confidence,
                     include_spans=include_spans,
-                    span_info=all_span_info[i],
+                    raw_span_logits=all_raw_logits[i],
+                    pred_counts=all_pred_counts[i],
                 )
                 results.append(sample_result)
             except Exception:
@@ -520,15 +515,15 @@ class ExtractorRuntimeMixin:
         self,
         batch: PreprocessedBatch,
         all_schema_embs: List[List[List[torch.Tensor]]],
-        all_span_info: List[Optional[Dict]],
+        all_raw_logits: List[List[Optional[torch.Tensor]]],
+        all_pred_counts: List[List[int]],
         threshold: float,
         metadata_list: List[Dict],
         include_confidence: bool,
         include_spans: bool,
     ) -> List[Dict[str, Any]]:
-        """Decode an accelerator batch with two grouped device reads."""
+        """Decode direct-span outputs with one grouped device transfer."""
         records: List[Dict[str, Any]] = []
-        count_tensors: List[torch.Tensor] = []
         value_tensors: List[torch.Tensor] = []
         value_offset = 0
 
@@ -589,54 +584,41 @@ class ExtractorRuntimeMixin:
                 record = {
                     "kind": "span",
                     "sample_index": sample_index,
+                    "task_index": task_index,
                     "schema_name": schema_name,
                     "task_type": task_type,
                     "field_names": field_names,
                     "cls_fields": cls_fields,
-                    "embs": embs,
                 }
-                if field_names:
-                    record["count_index"] = len(count_tensors)
-                    # Preserve the count head's [1, H] input shape.
-                    count_tensors.append(
-                        self.count_pred(embs[0].unsqueeze(0)).argmax(dim=1)
-                    )
-                else:
+
+                if not field_names:
                     record["empty_fields"] = True
+                    records.append(record)
+                    continue
+
+                predicted_count = (
+                    int(all_pred_counts[sample_index][task_index])
+                    if task_index < len(all_pred_counts[sample_index])
+                    else 0
+                )
+                record["predicted_count"] = predicted_count
+                raw_logits = (
+                    all_raw_logits[sample_index][task_index]
+                    if task_index < len(all_raw_logits[sample_index])
+                    else None
+                )
+                record["has_logits"] = raw_logits is not None
+
+                if predicted_count > 0 and raw_logits is not None:
+                    pack_tensor(record, "span_scores", torch.sigmoid(raw_logits))
+                    if (
+                        schema_name == "entities"
+                        and metadata_list[sample_index].get("entity_attribute_groups")
+                    ):
+                        pack_tensor(record, "raw_logits", raw_logits)
+
                 records.append(record)
 
-        # First synchronization: one small grouped transfer for all counts.
-        counts = torch.cat(count_tensors).tolist() if count_tensors else []
-
-        for record in records:
-            if record["kind"] != "span" or record.get("empty_fields"):
-                continue
-            predicted_count = int(counts[record["count_index"]])
-            record["predicted_count"] = predicted_count
-            sample_index = record["sample_index"]
-            span_info = all_span_info[sample_index]
-            if predicted_count <= 0 or span_info is None:
-                continue
-
-            struct_proj = self.count_embed(record["embs"][1:], predicted_count)
-            raw_logits = torch.einsum(
-                "lkd,bpd->bplk", span_info["span_rep"], struct_proj
-            )
-            span_scores = torch.sigmoid(raw_logits)
-
-            # Entity decoding consumes only structural instance zero.
-            if record["schema_name"] == "entities":
-                raw_logits = raw_logits[:1]
-                span_scores = span_scores[:1]
-            pack_tensor(record, "span_scores", span_scores)
-
-            if (
-                record["schema_name"] == "entities"
-                and metadata_list[sample_index].get("entity_attribute_groups")
-            ):
-                pack_tensor(record, "raw_logits", raw_logits)
-
-        # Second synchronization: all remaining decoder inputs.
         packed_values = (
             torch.cat(value_tensors).cpu() if value_tensors else torch.empty(0)
         )
@@ -667,10 +649,11 @@ class ExtractorRuntimeMixin:
                 continue
 
             predicted_count = record["predicted_count"]
-            if predicted_count <= 0 or all_span_info[sample_index] is None:
-                results[sample_index][schema_name] = (
-                    [] if schema_name == "entities" or task_type == "relations" else {}
-                )
+            if predicted_count <= 0 or not record["has_logits"]:
+                if schema_name == "entities" or task_type == "relations":
+                    results[sample_index][schema_name] = []
+                else:
+                    results[sample_index][schema_name] = {}
                 continue
 
             span_scores = unpack_tensor(record["span_scores"])
@@ -701,6 +684,106 @@ class ExtractorRuntimeMixin:
 
         return results
 
+    def _compute_direct_span_logits_batched(
+        self,
+        batch: PreprocessedBatch,
+        all_token_embs: List[torch.Tensor],
+        all_schema_embs: List[List[List[torch.Tensor]]],
+    ) -> Tuple[List[List[Optional[torch.Tensor]]], List[List[int]]]:
+        """Compute direct logits for every non-classification schema in a batch.
+
+        Query vectors from all span tasks belonging to the same sample are
+        concatenated so token-side span projections are computed only once.
+        Returned logits are restored to the legacy ``[count, fields, L, W]``
+        layout expected by the decoders.
+        """
+        batch_size = len(batch)
+        raw_logits: List[List[Optional[torch.Tensor]]] = [
+            [None] * len(batch.task_types[i]) for i in range(batch_size)
+        ]
+        pred_counts: List[List[int]] = [
+            [0] * len(batch.task_types[i]) for i in range(batch_size)
+        ]
+
+        # Batch the count head across every span task to avoid per-schema device
+        # synchronizations while preserving the same pointwise count network.
+        count_records = []
+        count_inputs = []
+        for sample_idx in range(batch_size):
+            if all_token_embs[sample_idx].numel() == 0:
+                continue
+            for task_idx, task_type in enumerate(batch.task_types[sample_idx]):
+                if task_type == "classifications":
+                    continue
+                if task_idx >= len(all_schema_embs[sample_idx]):
+                    continue
+                schema_emb_list = all_schema_embs[sample_idx][task_idx]
+                schema_tokens = batch.schema_tokens_list[sample_idx][task_idx]
+                if not schema_emb_list or len(schema_tokens) < 4:
+                    continue
+                if not any(
+                    schema_tokens[j] in ("[E]", "[C]", "[R]")
+                    for j in range(len(schema_tokens) - 1)
+                ):
+                    continue
+
+                embs = torch.stack(schema_emb_list)
+                count_records.append((sample_idx, task_idx, embs))
+                count_inputs.append(embs[0])
+
+        if count_inputs:
+            counts = self.count_pred(torch.stack(count_inputs)).argmax(dim=-1).tolist()
+        else:
+            counts = []
+
+        # Build count-aware structural queries and concatenate them by sample.
+        query_chunks: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+        query_slices: Dict[Tuple[int, int], Tuple[int, int, int, int]] = {}
+        query_offsets = [0] * batch_size
+
+        for (sample_idx, task_idx, embs), pred_count in zip(count_records, counts):
+            pred_count = int(pred_count)
+            pred_counts[sample_idx][task_idx] = pred_count
+            if pred_count <= 0:
+                continue
+
+            struct_proj = self.count_embed(embs[1:], pred_count)
+            if struct_proj.numel() == 0:
+                continue
+
+            # Entity decoding consumes only structural instance 0.
+            if batch.task_types[sample_idx][task_idx] == "entities":
+                struct_proj = struct_proj[:1]
+
+            count_dim, field_dim, hidden = struct_proj.shape
+            flat_queries = struct_proj.reshape(count_dim * field_dim, hidden)
+            start = query_offsets[sample_idx]
+            stop = start + flat_queries.shape[0]
+            query_offsets[sample_idx] = stop
+            query_chunks[sample_idx].append(flat_queries)
+            query_slices[(sample_idx, task_idx)] = (
+                start, stop, count_dim, field_dim
+            )
+
+        active_indices = [i for i, chunks in enumerate(query_chunks) if chunks]
+        if not active_indices:
+            return raw_logits, pred_counts
+
+        active_tokens = [all_token_embs[i] for i in active_indices]
+        active_queries = [torch.cat(query_chunks[i], dim=0) for i in active_indices]
+        direct_logits = self.compute_span_scores_batched(
+            active_tokens, active_queries, mask_invalid=True
+        )
+
+        logits_by_sample = dict(zip(active_indices, direct_logits))
+        for (sample_idx, task_idx), (start, stop, count_dim, field_dim) in query_slices.items():
+            task_logits = logits_by_sample[sample_idx][start:stop]
+            raw_logits[sample_idx][task_idx] = task_logits.reshape(
+                count_dim, field_dim, task_logits.shape[-2], task_logits.shape[-1]
+            )
+
+        return raw_logits, pred_counts
+
     def _extract_sample(
         self,
         token_embs: torch.Tensor,
@@ -716,15 +799,13 @@ class ExtractorRuntimeMixin:
         metadata: Dict,
         include_confidence: bool,
         include_spans: bool,
-        span_info: Optional[Dict] = None,
+        raw_span_logits: Optional[List[Optional[torch.Tensor]]] = None,
+        pred_counts: Optional[List[int]] = None,
     ) -> Dict[str, Any]:
-        """Extract from single sample."""
+        """Extract from single sample using precomputed direct span logits."""
         results = {}
-
-        if span_info is None:
-            has_span_task = any(t != "classifications" for t in task_types)
-            if has_span_task and token_embs.numel() > 0:
-                span_info = self.compute_span_rep(token_embs)
+        raw_span_logits = raw_span_logits or [None] * len(task_types)
+        pred_counts = pred_counts or [0] * len(task_types)
 
         cls_fields = {}
         for struct in schema.get("json_structures", []):
@@ -748,22 +829,10 @@ class ExtractorRuntimeMixin:
                 )
             else:
                 self._extract_span_result(
-                    results,
-                    schema_name,
-                    task_type,
-                    embs,
-                    span_info,
-                    schema_tokens,
-                    text_tokens,
-                    text_len,
-                    original_text,
-                    start_mapping,
-                    end_mapping,
-                    threshold,
-                    metadata,
-                    cls_fields,
-                    include_confidence,
-                    include_spans,
+                    results, schema_name, task_type, raw_span_logits[i],
+                    pred_counts[i], schema_tokens, text_tokens, text_len,
+                    original_text, start_mapping, end_mapping, threshold,
+                    metadata, cls_fields, include_confidence, include_spans,
                 )
 
         return results
@@ -875,8 +944,8 @@ class ExtractorRuntimeMixin:
         results: Dict,
         schema_name: str,
         task_type: str,
-        embs: torch.Tensor,
-        span_info: Dict,
+        raw_logits: Optional[torch.Tensor],
+        pred_count: int,
         schema_tokens: List[str],
         text_tokens: List[str],
         text_len: int,
@@ -889,7 +958,7 @@ class ExtractorRuntimeMixin:
         include_confidence: bool,
         include_spans: bool,
     ):
-        """Extract span-based results."""
+        """Decode precomputed direct span logits for one schema task."""
         field_names = []
         for j in range(len(schema_tokens) - 1):
             if schema_tokens[j] in ("[E]", "[C]", "[R]"):
@@ -899,10 +968,7 @@ class ExtractorRuntimeMixin:
             results[schema_name] = [] if schema_name == "entities" else {}
             return
 
-        count_logits = self.count_pred(embs[0].unsqueeze(0))
-        pred_count = int(count_logits.argmax(dim=1).item())
-
-        if pred_count <= 0 or span_info is None:
+        if pred_count <= 0 or raw_logits is None:
             if schema_name == "entities":
                 results[schema_name] = []
             elif task_type == "relations":
@@ -911,8 +977,6 @@ class ExtractorRuntimeMixin:
                 results[schema_name] = {}
             return
 
-        struct_proj = self.count_embed(embs[1:], pred_count)
-        raw_logits = torch.einsum("lkd,bpd->bplk", span_info["span_rep"], struct_proj)
         span_scores = torch.sigmoid(raw_logits)
 
         self._decode_span_probabilities(

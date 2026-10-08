@@ -1,4 +1,4 @@
-"""Parity tests for synchronization-collapsed span decoding."""
+"""Parity tests for synchronization-collapsed direct-span decoding."""
 
 from __future__ import annotations
 
@@ -49,23 +49,11 @@ class _FakeBatch:
 
 
 class _FakeRuntime(ExtractorRuntimeMixin):
-    def __init__(self):
-        self.count_shapes = []
-
-    def count_pred(self, embedding):
-        self.count_shapes.append(tuple(embedding.shape))
-        logits = embedding.new_full((embedding.shape[0], 20), -10.0)
-        logits[:, 1] = 10.0
-        return logits
-
-    def count_embed(self, field_embeddings, predicted_count):
-        return field_embeddings.unsqueeze(0).expand(predicted_count, -1, -1)
-
     def classifier(self, embeddings):
         return embeddings.sum(dim=-1, keepdim=True)
 
 
-def test_collapsed_decode_matches_existing_mixed_task_decoder():
+def test_collapsed_decode_matches_existing_direct_span_decoder():
     runtime = _FakeRuntime()
     batch = _FakeBatch()
     header = torch.zeros(4)
@@ -87,13 +75,13 @@ def test_collapsed_decode_matches_existing_mixed_task_decoder():
             torch.tensor([0.0, 2.0, 0.0, 0.0]),
         ],
     ]]
-    token_embs = [torch.zeros(2, 4)]
-    span_info = [{
-        "span_rep": torch.tensor([
-            [[2.0, 0.0, 0.0, 0.0]],
-            [[0.0, 2.0, 0.0, 0.0]],
-        ])
-    }]
+    all_raw_logits = [[
+        torch.tensor([[[[4.0], [0.0]]]]),
+        None,
+        torch.tensor([[[[4.0], [0.0]], [[0.0], [4.0]]]]),
+        torch.tensor([[[[4.0], [0.0]], [[0.0], [4.0]]]]),
+    ]]
+    all_pred_counts = [[1, 0, 1, 1]]
     metadata = [{
         "field_metadata": {},
         "entity_metadata": {},
@@ -106,10 +94,12 @@ def test_collapsed_decode_matches_existing_mixed_task_decoder():
         "relation_order": ["works_for"],
         "classification_tasks": ["sentiment"],
         "entity_attribute_groups": {},
+        "entity_attribute_prompt_labels": {},
+        "entity_attribute_labels": set(),
     }]
 
     expected = runtime._extract_sample(
-        token_embs=token_embs[0],
+        token_embs=torch.zeros(2, 4),
         schema_embs=schema_embs[0],
         schema_tokens_list=batch.schema_tokens_list[0],
         task_types=batch.task_types[0],
@@ -122,14 +112,15 @@ def test_collapsed_decode_matches_existing_mixed_task_decoder():
         metadata=metadata[0],
         include_confidence=True,
         include_spans=True,
-        span_info=span_info[0],
+        raw_span_logits=all_raw_logits[0],
+        pred_counts=all_pred_counts[0],
     )
-    runtime.count_shapes.clear()
 
     actual = runtime._extract_from_batch_sync_collapsed(
         batch=batch,
         all_schema_embs=schema_embs,
-        all_span_info=span_info,
+        all_raw_logits=all_raw_logits,
+        all_pred_counts=all_pred_counts,
         threshold=0.6,
         metadata_list=metadata,
         include_confidence=True,
@@ -138,8 +129,6 @@ def test_collapsed_decode_matches_existing_mixed_task_decoder():
 
     assert actual == [expected]
     assert list(actual[0]) == ["entities", "sentiment", "works_for", "product"]
-    assert runtime.count_shapes
-    assert all(shape[0] == 1 for shape in runtime.count_shapes)
 
 
 def test_collapsed_decode_is_enabled_by_default():
@@ -161,11 +150,14 @@ def _collapsed_and_eager(model, texts, schema, threshold=0.05):
         token_embs, schema_embs = model.processor.extract_embeddings_from_batch(
             model.encode_tokens(batch), batch.input_ids, batch
         )
-        span_info = model.compute_span_rep_batched(token_embs)
+        raw_logits, pred_counts = model._compute_direct_span_logits_batched(
+            batch, token_embs, schema_embs
+        )
         collapsed = model._extract_from_batch_sync_collapsed(
             batch=batch,
             all_schema_embs=schema_embs,
-            all_span_info=span_info,
+            all_raw_logits=raw_logits,
+            all_pred_counts=pred_counts,
             threshold=threshold,
             metadata_list=metadata,
             include_confidence=True,
@@ -186,7 +178,8 @@ def _collapsed_and_eager(model, texts, schema, threshold=0.05):
                 metadata=metadata[i],
                 include_confidence=True,
                 include_spans=True,
-                span_info=span_info[i],
+                raw_span_logits=raw_logits[i],
+                pred_counts=pred_counts[i],
             )
             for i in range(len(batch))
         ]
