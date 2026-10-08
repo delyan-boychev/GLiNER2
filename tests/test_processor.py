@@ -511,6 +511,74 @@ class TestSchemaTransformerE2E:
 
 
 # ===========================================================================
+# Explicit gold spans
+# ===========================================================================
+
+
+# token offsets: Pushkin 0, street 1, runs 2, past 3, the 4, Pushkin 5, monument 6
+SPAN_TEXT = "Pushkin street runs past the Pushkin monument."
+
+
+class TestGoldSpans:
+    @staticmethod
+    def _entity_labels(processor, mentions, **kwargs):
+        schema = {"entities": {"street": mentions}}
+        return processor.transform_record(SPAN_TEXT, schema, **kwargs).structure_labels
+
+    def test_span_pins_one_occurrence_of_a_repeated_surface(self, processor_no_sampling):
+        p = processor_no_sampling
+        assert self._entity_labels(p, ["Pushkin"]) == [[1, [[[(0, 0), (5, 5)]]]]]
+        assert self._entity_labels(
+            p, [{"text": "Pushkin", "start": 0, "end": 7}]
+        ) == [[1, [[[(0, 0)]]]]]
+        assert self._entity_labels(
+            p, [{"text": "Pushkin", "start": 29, "end": 36}]
+        ) == [[1, [[[(5, 5)]]]]]
+
+    def test_span_must_cover_the_text_it_claims(self, processor_no_sampling):
+        with pytest.raises(ValueError, match="not 'Pushkin'"):
+            self._entity_labels(
+                processor_no_sampling, [{"text": "Pushkin", "start": 1, "end": 8}]
+            )
+
+    def test_span_past_max_len_is_not_found(self, processor_no_sampling):
+        p = processor_no_sampling
+        far = {"text": "Pushkin", "start": 29, "end": 36}
+        assert self._entity_labels(p, [far], max_len=3) == [[1, [[[(-1, -1)]]]]]
+        assert self._entity_labels(p, [far], max_len=50) == [[1, [[[(5, 5)]]]]]
+        # a span straddling the cut keeps the tokens that survived it
+        assert self._entity_labels(
+            p, [{"text": "street runs past", "start": 8, "end": 24}], max_len=3
+        ) == [[1, [[[(1, 2)]]]]]
+
+    def test_spans_and_surfaces_mix_within_one_structure(self, processor_no_sampling):
+        schema = {
+            "json_structures": [
+                {"place": {"name": {"text": "Pushkin", "start": 0, "end": 7}}},
+                {"place": {"name": "monument"}},
+            ]
+        }
+        record = processor_no_sampling.transform_record(SPAN_TEXT, schema)
+        assert record.structure_labels == [[2, [[[(0, 0)]], [[(6, 6)]]]]]
+
+    def test_span_is_rejected_for_a_choice_field(self, processor_no_sampling):
+        schema = {
+            "json_structures": [
+                {
+                    "place": {
+                        "kind": {
+                            "value": {"text": "Pushkin", "start": 0, "end": 7},
+                            "choices": ["street", "monument"],
+                        }
+                    }
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="cannot be pinned to a span"):
+            processor_no_sampling.transform_record(SPAN_TEXT, schema)
+
+
+# ===========================================================================
 # Classification Prefix
 # ===========================================================================
 

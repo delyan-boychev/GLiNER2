@@ -10,11 +10,12 @@ import logging
 import random
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, Tuple, List, Optional
+from typing import Any, Dict, Mapping, NamedTuple, Tuple, List, Optional
 import torch
 from transformers import AutoTokenizer
 
 from gliner2.classification.errors import SchemaError
+from gliner2.processing.targets import SurfaceSpan, char_span_to_word_boundaries
 from gliner2.processing.word_splitter import (  # noqa: F401 - public re-exports
     CharLevelSplitter,
     WhitespaceTokenSplitter,
@@ -30,6 +31,24 @@ _TOKENIZE_CACHE_SIZE = 50_000
 # =============================================================================
 # Data Structures
 # =============================================================================
+
+
+class _GoldContext(NamedTuple):
+    text: str
+    text_tokens: List[str]
+    start_idx_map: List[int]
+    end_idx_map: List[int]
+    len_prefix: int
+    # character end of the last token max_len kept, None when nothing was cut
+    char_limit: Optional[int]
+
+
+def _parse_gold(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return SurfaceSpan.from_mapping(value)
+    if isinstance(value, list):
+        return [_parse_gold(v) for v in value]
+    return value
 
 
 @dataclass
@@ -637,10 +656,13 @@ class SchemaTransformer:
             start_idx_map.append(start)
             end_idx_map.append(end)
 
-        if max_len is not None:
+        char_limit = None
+        if max_len is not None and len(text_tokens) > max_len:
             text_tokens = text_tokens[:max_len]
             start_idx_map = start_idx_map[:max_len]
             end_idx_map = end_idx_map[:max_len]
+            # gold starting past the last retained token was cut, not misplaced
+            char_limit = end_idx_map[-1] if end_idx_map else 0
 
         if prefix:
             text_tokens = prefix + text_tokens
@@ -649,9 +671,15 @@ class SchemaTransformer:
         # Infer schema
         processed = self._infer_from_json(schema)
 
-        results = self._build_outputs(
-            processed, schema, text_tokens, len_prefix, build_targets=build_targets
+        ctx = _GoldContext(
+            text=text,
+            text_tokens=text_tokens,
+            start_idx_map=start_idx_map,
+            end_idx_map=end_idx_map,
+            len_prefix=len_prefix,
+            char_limit=char_limit,
         )
+        results = self._build_outputs(processed, schema, ctx, build_targets=build_targets)
 
         # Format input
         schema_tokens_list = [r["schema_tokens"] for r in results]
@@ -861,6 +889,12 @@ class SchemaTransformer:
         """Wrap classification field values with [selection] prefix."""
 
         def wrap(val):
+            values = val if isinstance(val, list) else [val]
+            if any(isinstance(v, Mapping) for v in values):
+                raise ValueError(
+                    "choice field values select from a label set and cannot be "
+                    "pinned to a span"
+                )
             if isinstance(val, list):
                 return [f"[selection]{v}" for v in val]
             return f"[selection]{val}"
@@ -987,7 +1021,7 @@ class SchemaTransformer:
             # Build spans
             spans = []
             for occ in occurrences:
-                span = [occ.get(f) for f in chosen]
+                span = [_parse_gold(occ.get(f)) for f in chosen]
                 spans.append(span)
 
             # Dedup
@@ -1055,7 +1089,7 @@ class SchemaTransformer:
         ]
 
         if chosen:
-            span = [schema["entities"][e] for e in chosen]
+            span = [_parse_gold(schema["entities"][e]) for e in chosen]
             labels.append([1, [span]])
 
             mode = (
@@ -1099,7 +1133,7 @@ class SchemaTransformer:
             spans = []
             for occ in occurrences:
                 if all(f in occ for f in field_names):
-                    spans.append([occ[f] for f in field_names])
+                    spans.append([_parse_gold(occ[f]) for f in field_names])
 
             if not spans:
                 continue
@@ -1242,8 +1276,7 @@ class SchemaTransformer:
         self,
         processed: Dict,
         schema: Dict,
-        text_tokens: List[str],
-        len_prefix: int,
+        ctx: _GoldContext,
         *,
         build_targets: Optional[bool] = False,
     ) -> List[Dict]:
@@ -1267,32 +1300,10 @@ class SchemaTransformer:
                         if isinstance(element, list):
                             nested = []
                             for sub in element:
-                                if str(sub).startswith("[selection]"):
-                                    # Use case-insensitive matching for choice fields
-                                    pos = self._find_sublist(
-                                        [str(sub)[11:]],
-                                        text_tokens[:len_prefix],
-                                        case_insensitive=True,
-                                    )
-                                else:
-                                    pos = self._find_sublist(
-                                        self._tokenize_text(str(sub)), text_tokens
-                                    )
-                                nested.extend(pos)
+                                nested.extend(self._resolve_gold(sub, ctx))
                             positions.append(nested)
                         else:
-                            if str(element).startswith("[selection]"):
-                                # Use case-insensitive matching for choice fields
-                                pos = self._find_sublist(
-                                    [str(element)[11:]],
-                                    text_tokens[:len_prefix],
-                                    case_insensitive=True,
-                                )
-                            else:
-                                pos = self._find_sublist(
-                                    self._tokenize_text(str(element)), text_tokens
-                                )
-                            positions.append(pos)
+                            positions.append(self._resolve_gold(element, ctx))
                     transformed.append(positions)
 
                 results.append(
@@ -1332,6 +1343,32 @@ class SchemaTransformer:
                 )
 
         return results
+
+    def _resolve_gold(self, value: Any, ctx: _GoldContext) -> List[Tuple[int, int]]:
+        if isinstance(value, SurfaceSpan):
+            return [self._resolve_span(value, ctx)]
+        text = str(value)
+        if text.startswith("[selection]"):
+            # Use case-insensitive matching for choice fields
+            return self._find_sublist(
+                [text[11:]], ctx.text_tokens[: ctx.len_prefix], case_insensitive=True
+            )
+        return self._find_sublist(self._tokenize_text(text), ctx.text_tokens)
+
+    def _resolve_span(self, value: SurfaceSpan, ctx: _GoldContext) -> Tuple[int, int]:
+        covered = ctx.text[value.start : value.end]
+        if covered != value.text:
+            raise ValueError(
+                f"gold span [{value.start}, {value.end}) covers {covered!r}, "
+                f"not {value.text!r}"
+            )
+        if ctx.char_limit is not None and value.start >= ctx.char_limit:
+            return (-1, -1)
+        token_start, token_end = char_span_to_word_boundaries(
+            value.start, value.end, ctx.start_idx_map, ctx.end_idx_map
+        )
+        # mirrors word_offsets on the decode side: maps are unprefixed, tokens are not
+        return token_start + ctx.len_prefix, token_end - 1 + ctx.len_prefix
 
     def _find_sublist(
         self, sub: List[str], lst: List[str], case_insensitive: bool = False

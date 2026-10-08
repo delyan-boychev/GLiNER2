@@ -53,15 +53,36 @@ import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Tuple, Iterator, TYPE_CHECKING
+from typing import (
+    Any, Dict, List, Mapping, Optional, Union, Tuple, Iterator, TYPE_CHECKING
+)
 from collections import Counter
 from tqdm import tqdm
+
+from gliner2.processing.targets import SurfaceSpan
 
 if TYPE_CHECKING:
     # Import-only (avoids a circular import with the trainer at runtime) so the
     # ``'ExtractorDataset'`` forward reference in ``DataInput`` resolves for
     # static type checkers / ``get_type_hints``.
     from gliner2.training.trainer import ExtractorDataset
+
+
+def _is_locatable(value: Any, text: str) -> bool:
+    # an absent field is not an annotation, so there is nothing to locate
+    if value is None or value == "":
+        return True
+    if isinstance(value, Mapping):
+        try:
+            span = SurfaceSpan.from_mapping(value)
+        except ValueError:
+            return False
+        return text[span.start : span.end] == span.text
+    if isinstance(value, list):
+        return all(_is_locatable(v, text) for v in value)
+    if isinstance(value, str):
+        return value.lower() in text.lower()
+    return False
 
 
 class DataValidationError(Exception):
@@ -569,20 +590,20 @@ class Structure:
                 errors.extend(value.validate(f"{self.struct_name}.{field_name}"))
             elif isinstance(value, list):
                 for i, v in enumerate(value):
-                    if v is not None and not isinstance(v, str):
+                    if v is not None and not isinstance(v, (str, Mapping)):
                         errors.append(
                             f"List value at index {i} in "
-                            f"'{self.struct_name}.{field_name}' must be a string"
+                            f"'{self.struct_name}.{field_name}' must be a string or span"
                         )
-                    elif v and v.lower() not in text.lower():
+                    elif not _is_locatable(v, text):
                         errors.append(f"List value '{v}' at index {i} in '{self.struct_name}.{field_name}' not found in text")
-            elif isinstance(value, str):
-                if value and value.lower() not in text.lower():
+            elif isinstance(value, (str, Mapping)):
+                if not _is_locatable(value, text):
                     errors.append(f"Value '{value}' for '{self.struct_name}.{field_name}' not found in text")
             elif value is not None:
                 errors.append(
                     f"Value for '{self.struct_name}.{field_name}' must be a string, "
-                    "list of strings, or ChoiceField"
+                    "span, list of them, or ChoiceField"
                 )
         return errors
 
@@ -657,9 +678,8 @@ class Relation:
         if not self._fields:
             errors.append(f"Relation '{self.name}' has no fields")
         for field_name, value in self._fields.items():
-            if isinstance(value, str) and value:
-                if value.lower() not in text.lower():
-                    errors.append(f"Relation value '{value}' for '{self.name}.{field_name}' not found in text")
+            if not _is_locatable(value, text):
+                errors.append(f"Relation value '{value}' for '{self.name}.{field_name}' not found in text")
         return errors
 
     def get_field_names(self) -> List[str]:
@@ -735,7 +755,7 @@ class InputExample:
                 if not entity_type:
                     errors.append("Entity type cannot be empty")
                 for mention in mentions:
-                    if mention and mention.lower() not in self.text.lower():
+                    if not _is_locatable(mention, self.text):
                         errors.append(f"Entity '{mention}' (type: {entity_type}) not found in text")
 
         if self.entity_descriptions and self.entities:
@@ -805,7 +825,7 @@ class InputExample:
                 # Check if any mention is not in text
                 has_invalid = False
                 for mention in mentions:
-                    if mention and mention.lower() not in self.text.lower():
+                    if not _is_locatable(mention, self.text):
                         has_invalid = True
                         warnings.append(f"Entity '{mention}' (type: {entity_type}) not found in text - dropping entity type")
                         break
@@ -858,12 +878,12 @@ class InputExample:
                             is_valid = False
                     elif isinstance(value, list):
                         for v in value:
-                            if v and v.lower() not in self.text.lower():
+                            if not _is_locatable(v, self.text):
                                 warnings.append(f"List value '{v}' in '{struct.struct_name}.{field_name}' not found - dropping field")
                                 is_valid = False
                                 break
-                    elif isinstance(value, str):
-                        if value and value.lower() not in self.text.lower():
+                    elif isinstance(value, (str, Mapping)):
+                        if not _is_locatable(value, self.text):
                             warnings.append(f"Value '{value}' for '{struct.struct_name}.{field_name}' not found - dropping field")
                             is_valid = False
                     
@@ -894,11 +914,10 @@ class InputExample:
                 # Check if any field value is invalid
                 has_invalid = False
                 for field_name, value in rel._fields.items():
-                    if isinstance(value, str) and value:
-                        if value.lower() not in self.text.lower():
-                            warnings.append(f"Relation '{rel.name}' field '{field_name}' value '{value}' not found - dropping relation")
-                            has_invalid = True
-                            break
+                    if not _is_locatable(value, self.text):
+                        warnings.append(f"Relation '{rel.name}' field '{field_name}' value '{value}' not found - dropping relation")
+                        has_invalid = True
+                        break
                 
                 if not has_invalid:
                     valid_relations.append(rel)
