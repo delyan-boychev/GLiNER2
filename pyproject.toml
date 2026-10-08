@@ -48,6 +48,10 @@ local = [
     "torch>=2.1,<3",
     "transformers>=4.38,<5",
 ]
+disentangled-flash = [
+    "disentangled-flash>=1.1,<2",
+    "transformers>=4.57,<5",
+]
 train = [
     "numpy>=1.24,<3",
     "peft>=0.10,<1",
