@@ -15,11 +15,15 @@ This tutorial covers all the ways to perform text classification with GLiNER2, f
 ## Setup
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
-# Load the pre-trained model
-extractor = GLiNER2.from_pretrained("your-model-name")
+# GLiNER2.5 boundary checkpoint (English). Use gliner2.5-multi-v1 for multilingual.
+extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 ```
+
+For **hard cross-task constraints** (e.g. intent implies effects), use the
+[`Classifier` API](14-constrained_classification.md) instead of independent
+`classify_text` decoding.
 
 ## Single-Label Classification
 
@@ -119,7 +123,7 @@ For simple classification tasks without building a schema.
 ### Single Task
 
 ```python
-text = "The new AI model shows remarkable performance improvements."
+text = "The new AI extractor shows remarkable performance improvements."
 results = extractor.classify_text(
     text,
     {"sentiment": ["positive", "negative", "neutral"]}

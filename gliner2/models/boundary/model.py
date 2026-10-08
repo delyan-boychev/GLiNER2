@@ -13,21 +13,37 @@ Half-open ``[start, end)`` coordinates throughout; there is no width axis.
 
 from __future__ import annotations
 
-import math
+import logging
 import os
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+import tempfile
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoConfig
+
+if TYPE_CHECKING:
+    from peft import PeftModel
 
 from gliner2.configuration import BoundaryHeadSettings, ExtractorConfig
 from gliner2.layers import create_mlp
-from gliner2.models.base import BaseExtractorModel, EncodedBatch
-from gliner2.models.boundary.encoding import BoundaryEncoder
+from gliner2.models.base import (
+    BaseExtractorModel,
+    EncodedBatch,
+    load_extractor_tokenizer,
+)
+from gliner2.models.loading import (
+    apply_post_load_options,
+    checkpoint_file,
+    load_checkpoint_state_dict,
+    pop_attention_backend,
+    pop_disentangled_flash_options,
+    reconcile_encoder_embeddings,
+    split_load_kwargs,
+)
+from gliner2.models.boundary.encoding import BoundaryEncoder, BoundaryEncoding
 from gliner2.models.boundary.constants import MASK_LOGIT
 from gliner2.models.boundary.heads import BoundaryMarginals, BoundaryQueryHead
 from gliner2.models.boundary.losses import (
@@ -55,6 +71,11 @@ from gliner2.models.boundary.pool import (
     SharedPoolScorer,
 )
 from gliner2.models.boundary.targets_device import dense_targets_from_pairs
+from gliner2.models.boundary.validation import (
+    safe_relation_indices,
+    validate_candidate_indices,
+    validate_masked_spans,
+)
 from gliner2.models.boundary.relations import (
     RelationProposalSettings,
     RelationTypeSpec,
@@ -66,12 +87,20 @@ from gliner2.models.outputs import CandidateTensorBatch, ExtractorOutput
 from gliner2.processing.targets import (
     MentionTarget,
     PaddedTargetBatch,
+    TargetCapacityError,
     TargetGraph,
     pad_target_graphs,
 )
+from gliner2.utils.device_errors import is_fatal_device_error
 
 
 DEFAULT_LOSS_WEIGHTS = {"start": 1.0, "end": 1.0, "pair": 1.0, "inside": 0.5}
+logger = logging.getLogger(__name__)
+
+
+def _finite_loss_term(value: torch.Tensor) -> torch.Tensor:
+    """Discard non-finite scalar loss contributions without poisoning training."""
+    return torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _pad_states(
@@ -243,6 +272,150 @@ class BoundaryHead(nn.Module):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"soft IoU scale must be in [0, 1], got {value}")
         self._soft_iou_scale = float(value)
+
+    def score_explicit_spans(
+        self,
+        token_states: torch.Tensor,
+        text_mask: torch.BoolTensor,
+        query_states: torch.Tensor,
+        query_mask: torch.BoolTensor,
+        indices: torch.LongTensor,
+        valid_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
+        """Score caller-provided half-open spans for every query.
+
+        ``indices`` is ``[B, Q, C, 2]``.  Unlike normal inference, this path
+        bypasses sparse proposal selection while retaining the exact proposal
+        compatibility prior and pair-reranker computation used by ordinary
+        candidates.  It is intended for span-conditioned features such as
+        entity attributes and constrained structure fields.
+        """
+        if indices.dim() != 4 or indices.shape[-1] != 2:
+            raise ValueError(
+                f"indices must be [B, Q, C, 2], got {tuple(indices.shape)}"
+            )
+        b, q, _, _ = indices.shape
+        if (
+            b != token_states.shape[0]
+            or b != query_states.shape[0]
+            or q != query_states.shape[1]
+        ):
+            raise ValueError("explicit span batch/query dimensions do not match states")
+
+        text_lengths = text_mask.sum(dim=1).long()
+        starts = indices[..., 0]
+        ends = indices[..., 1]
+        legal = (
+            (starts >= 0)
+            & (ends > starts)
+            & (ends <= text_lengths.view(b, 1, 1))
+            & query_mask.unsqueeze(-1)
+        )
+        if valid_mask is not None:
+            if valid_mask.shape != indices.shape[:-1]:
+                raise ValueError(
+                    "valid_mask must match indices [B, Q, C], got "
+                    f"{tuple(valid_mask.shape)} and {tuple(indices.shape)}"
+                )
+            legal = legal & valid_mask
+
+        encoding = self.boundary_encoder(token_states, text_mask)
+        marginals = self.boundary_query_head(
+            encoding.states,
+            encoding.mask,
+            token_states,
+            text_mask,
+            query_states,
+            query_mask,
+        )
+        inside_prefix = (
+            marginals.inside_prefix if self.use_inside_evidence else None
+        )
+        if self.settings.candidate_pool == "shared":
+            return self._score_explicit_spans_shared(
+                encoding,
+                marginals,
+                inside_prefix,
+                text_lengths,
+                token_states,
+                text_mask,
+                query_states,
+                query_mask,
+                indices,
+                legal,
+            )
+        compatibility = self.boundary_proposer.score_explicit_pairs(
+            encoding.states, query_states, indices, legal
+        )
+        proposals = BoundaryProposals(
+            indices=indices,
+            logits=None,
+            valid_mask=legal,
+            compat_logits=compatibility,
+        )
+        return self.pair_scorer(
+            encoding.states,
+            query_states,
+            proposals,
+            marginals.start_logits,
+            marginals.end_logits,
+            inside_prefix,
+            text_lengths,
+            token_states,
+            text_mask,
+            inside_prefix_mean=marginals.inside_prefix_mean,
+        )
+
+    def _score_explicit_spans_shared(
+        self,
+        encoding: BoundaryEncoding,
+        marginals: BoundaryMarginals,
+        inside_prefix: Optional[torch.Tensor],
+        text_lengths: torch.LongTensor,
+        token_states: torch.Tensor,
+        text_mask: torch.BoolTensor,
+        query_states: torch.Tensor,
+        query_mask: torch.BoolTensor,
+        indices: torch.LongTensor,
+        legal: torch.BoolTensor,
+    ) -> torch.Tensor:
+        # pooled spans attend to each other, so score the requested spans inside
+        # the pool
+        pooled = self.shared_pool_builder(
+            encoding.states,
+            encoding.mask,
+            query_mask,
+            marginals.start_logits,
+            marginals.end_logits,
+            gold_pairs=indices,
+            gold_mask=legal,
+            gold_injection_prob=1.0,
+        )
+        logits, _ = self.shared_pool_scorer(
+            encoding.states,
+            query_states,
+            query_mask,
+            pooled,
+            marginals.start_logits,
+            marginals.end_logits,
+            inside_prefix,
+            text_lengths,
+            token_states,
+            text_mask,
+            inside_prefix_mean=marginals.inside_prefix_mean,
+        )
+        match = (
+            (indices.unsqueeze(3) == pooled.indices[:, None, None]).all(-1)
+            & pooled.mask[:, None, None]
+        )
+        if (legal & ~match.any(-1)).any():
+            raise ValueError(
+                "explicit spans exceed the shared candidate pool "
+                f"(pool_size={self.settings.pool_size})"
+            )
+        position = match.long().argmax(-1)
+        scores = logits.transpose(1, 2).gather(2, position)
+        return scores.masked_fill(~legal, MASK_LOGIT)
 
     def forward(
         self,
@@ -580,13 +753,21 @@ class BoundaryHead(nn.Module):
         pooled_pair_logits: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         boundary_keep = boundary_mask.unsqueeze(1) & query_mask.unsqueeze(-1)  # [B,Q,L+1]
+        n_boundary = marginals.start_logits.shape[2]
         start_targets = targets.start_targets
         end_targets = targets.end_targets
         inside_targets = targets.inside_targets
         if start_targets is None or end_targets is None or inside_targets is None:
+            safe_pairs = targets.mention_pairs.clamp(0, n_boundary - 1)
             start_targets, end_targets, inside_targets = dense_targets_from_pairs(
-                targets.mention_pairs, targets.mention_mask, text_mask.shape[-1]
+                safe_pairs, targets.mention_mask, text_mask.shape[-1]
             )
+        if start_targets.shape[-1] != n_boundary:
+            start_targets = start_targets[..., :n_boundary] if start_targets.shape[-1] > n_boundary else torch.nn.functional.pad(start_targets, (0, n_boundary - start_targets.shape[-1]))
+            end_targets = end_targets[..., :n_boundary] if end_targets.shape[-1] > n_boundary else torch.nn.functional.pad(end_targets, (0, n_boundary - end_targets.shape[-1]))
+        if inside_targets.shape[-1] != marginals.inside_logits.shape[-1]:
+            tgt_n = marginals.inside_logits.shape[-1]
+            inside_targets = inside_targets[..., :tgt_n] if inside_targets.shape[-1] > tgt_n else torch.nn.functional.pad(inside_targets, (0, tgt_n - inside_targets.shape[-1]))
         start_targets = start_targets.to(marginals.start_logits.dtype)
         end_targets = end_targets.to(marginals.end_logits.dtype)
         inside_targets = inside_targets.to(marginals.inside_logits.dtype)
@@ -769,6 +950,32 @@ class BoundaryHead(nn.Module):
                 count_log_rates, targets.mention_mask, query_mask
             )
 
+        (
+            start_loss,
+            end_loss,
+            pair_loss,
+            soft_iou_loss,
+            rerank_loss,
+            inside_loss,
+            proposal_loss,
+            consistency_loss,
+            null_loss,
+            count_loss,
+        ) = (
+            _finite_loss_term(value)
+            for value in (
+                start_loss,
+                end_loss,
+                pair_loss,
+                soft_iou_loss,
+                rerank_loss,
+                inside_loss,
+                proposal_loss,
+                consistency_loss,
+                null_loss,
+                count_loss,
+            )
+        )
         w = self.loss_weights
         total = (
             w.get("start", 1.0) * start_loss
@@ -808,7 +1015,7 @@ class BoundaryHead(nn.Module):
 def _group_scored_candidates(
     candidates: CandidateTensorBatch,
     *,
-    threshold: float = 0.5,
+    threshold: Union[float, torch.Tensor] = 0.5,
     probabilities: Optional[torch.Tensor] = None,
     count_log_rates: Optional[torch.Tensor] = None,
     adaptive_threshold: bool = False,
@@ -820,7 +1027,17 @@ def _group_scored_candidates(
         if probabilities is None else probabilities
     )
     eligible = candidates.valid_mask & candidates.query_mask.unsqueeze(-1)
-    keep = eligible & (probs >= threshold)
+    threshold_value = threshold
+    if isinstance(threshold, torch.Tensor):
+        if threshold.shape != probs.shape[:2]:
+            raise ValueError(
+                "tensor threshold must be [B, Q], got "
+                f"{tuple(threshold.shape)} for probabilities {tuple(probs.shape)}"
+            )
+        threshold_value = threshold.to(
+            device=probs.device, dtype=probs.dtype
+        ).unsqueeze(-1)
+    keep = eligible & (probs >= threshold_value)
     if adaptive_threshold:
         if count_log_rates is None:
             raise ValueError(
@@ -963,7 +1180,30 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 total = total + parameter.sum() * 0.0
         return total
 
-    def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
+    def __init__(
+        self,
+        config: ExtractorConfig,
+        encoder_config=None,
+        tokenizer=None,
+        use_flashdeberta: Optional[bool] = None,
+        word_splitter=None,
+        load_encoder: bool = True,
+    ):
+        """Build the boundary model.
+
+        Args:
+            config: Extractor config with ``architecture="boundary"``.
+            encoder_config: Encoder config; required when ``load_encoder`` is False.
+            tokenizer: Optional tokenizer; defaults to ``config.model_name``'s.
+            use_flashdeberta: Force the FlashDeBERTa backend on or off.
+            word_splitter: Optional word splitter name or callable.
+            load_encoder: When False, build heads only and set ``encoder`` to
+                ``None``; inference then requires ``hidden_states``.
+
+        Raises:
+            ValueError: On a non-boundary config, or ``load_encoder=False``
+                without ``encoder_config``.
+        """
         super().__init__(config)
         if config.architecture != "boundary":
             raise ValueError(
@@ -974,17 +1214,32 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         from gliner2.processor import SchemaTransformer
         if tokenizer is not None:
-            self.processor = SchemaTransformer(tokenizer=tokenizer, token_pooling=config.token_pooling)
+            self.processor = SchemaTransformer(
+                tokenizer=tokenizer,
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
+            )
         else:
-            self.processor = SchemaTransformer(config.model_name, token_pooling=config.token_pooling)
+            self.processor = SchemaTransformer(
+                config.model_name,
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
+            )
 
-        self.encoder = self._load_encoder(
-            config.model_name,
-            encoder_config,
-            getattr(config, "attn_implementation", "sdpa"),
-        )
-        self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
-        self.hidden_size = self.encoder.config.hidden_size
+        if load_encoder:
+            self.encoder = self._load_encoder(
+                config.model_name,
+                encoder_config,
+                getattr(config, "attn_implementation", "sdpa"),
+                use_flashdeberta=use_flashdeberta,
+            )
+            self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
+            self.hidden_size = self.encoder.config.hidden_size
+        else:
+            if encoder_config is None:
+                raise ValueError("load_encoder=False requires encoder_config")
+            self.encoder = None
+            self.hidden_size = encoder_config.hidden_size
 
         self.classifier = create_mlp(
             input_dim=self.hidden_size,
@@ -1033,11 +1288,35 @@ class BoundaryExtractorModel(BaseExtractorModel):
         self._lora_layers = {}
         self._adapter_config = None
 
+    def quantize(self, method: str = "fp16") -> "BoundaryExtractorModel":
+        """Cast the complete boundary model for lower-precision inference.
+
+        Args:
+            method: ``"fp16"`` (span-parity default) or ``"bf16"``.
+        """
+        normalized = str(method).strip().lower()
+        aliases = {
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "half": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        if normalized not in aliases:
+            raise ValueError(
+                "quantize method must be 'fp16' or 'bf16', "
+                f"got {method!r}"
+            )
+        self.to(dtype=aliases[normalized])
+        logger.info("Converted boundary model to %s", normalized)
+        return self
+
     def compile(self, dynamic: bool = True) -> "BoundaryExtractorModel":
         """Compile the backbone and tensor-heavy boundary regions in place."""
         if not hasattr(torch, "compile"):
             raise RuntimeError("BoundaryExtractorModel.compile requires torch.compile")
-        self.encoder = torch.compile(self.encoder, dynamic=dynamic)
+        if self.encoder is not None:
+            self.encoder = torch.compile(self.encoder, dynamic=dynamic)
         self.boundary_head.boundary_encoder = torch.compile(
             self.boundary_head.boundary_encoder, dynamic=dynamic
         )
@@ -1059,11 +1338,41 @@ class BoundaryExtractorModel(BaseExtractorModel):
             )
         return self
 
+    def apply_lora(
+        self,
+        r: int = 8,
+        alpha: float = 16.0,
+        dropout: float = 0.0,
+        targets: Optional[List[str]] = None,
+        use_dora: bool = False,
+    ) -> "PeftModel":
+        """Apply PEFT LoRA adapters and return the wrapped boundary model."""
+        from gliner2.training.lora import _cast_lora_dtype, _resolve_targets
+        from peft import LoraConfig as PeftLoraConfig, get_peft_model
+
+        base_id = (
+            getattr(self, "name_or_path", "")
+            or getattr(self.config, "_name_or_path", "")
+            or None
+        )
+        peft_config = PeftLoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=_resolve_targets(self, targets or ["encoder"]),
+            bias="none",
+            use_dora=use_dora,
+            base_model_name_or_path=base_id,
+        )
+        peft_model = get_peft_model(self, peft_config)
+        _cast_lora_dtype(peft_model)
+        return peft_model
+
     # =========================================================================
     # Encoding
     # =========================================================================
 
-    def _encode_core(self, batch) -> Dict[str, Any]:
+    def _encode_core(self, batch, hidden_states=None) -> Dict[str, Any]:
         """Encode a ``PreprocessedBatch`` into padded states + query enumeration.
 
         Every extractive schema child (``[E]``/``[C]``/``[R]`` marker) becomes one
@@ -1072,11 +1381,17 @@ class BoundaryExtractorModel(BaseExtractorModel):
         ``structure_labels``. Classification schemas are enumerated separately and
         scored by the shared classifier. No fixed cross-sample query layout is
         required, so training-time task shuffling is handled naturally.
+
+        Args:
+            batch: The collated batch.
+            hidden_states: Optional per-row encoder output; see ``encode_tokens``.
+
+        Returns:
+            Padded text/query states, masks, and per-sample query specs.
         """
         device = next(self.parameters()).device
         batch = batch.to(device)
-        outputs = self.encoder(input_ids=batch.input_ids, attention_mask=batch.attention_mask)
-        token_embeddings = outputs.last_hidden_state
+        token_embeddings = self.encode_tokens(batch, hidden_states)
         fast_routing = (
             getattr(self.processor, "token_pooling", None) == "first"
             and getattr(batch, "text_word_indices", None) is not None
@@ -1089,8 +1404,9 @@ class BoundaryExtractorModel(BaseExtractorModel):
             h = token_embeddings.shape[-1]
 
             def gather_routed(indices, mask):
+                safe_idx = indices.clamp(0, token_embeddings.shape[1] - 1)
                 states = token_embeddings.gather(
-                    1, indices.unsqueeze(-1).expand(-1, -1, h)
+                    1, safe_idx.unsqueeze(-1).expand(-1, -1, h)
                 )
                 return states * mask.unsqueeze(-1).to(states.dtype)
 
@@ -1125,9 +1441,9 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 ext_specs.append(specs_i)
                 text_len_i = (
                     len(batch.start_mappings[i])
-                    if batch.start_mappings else batch.text_word_counts[i]
+                    if batch.start_mappings else int(batch.text_word_counts[i])
                 )
-                word_offsets.append(max(batch.text_word_counts[i] - text_len_i, 0))
+                word_offsets.append(max(int(batch.text_word_counts[i]) - text_len_i, 0))
 
                 cls_i = []
                 cls_offset = 0
@@ -1169,6 +1485,9 @@ class BoundaryExtractorModel(BaseExtractorModel):
                     if len(role_ids) < 2:
                         continue
                     head_id, tail_id = role_ids[:2]
+                    max_q = query_states.shape[1] - 1
+                    head_id = min(head_id, max_q)
+                    tail_id = min(tail_id, max_q)
                     role_states = query_states[i, [head_id, tail_id]]
                     relation_state = (
                         torch.cat((role_states[0], role_states[1]), dim=-1)
@@ -1337,17 +1656,25 @@ class BoundaryExtractorModel(BaseExtractorModel):
             specs = core["ext_specs"][i]
             length = int(core["text_lengths"][i])
             mentions: List[MentionTarget] = []
-            for qid, spec in enumerate(specs):
-                structure = structure_labels[i][spec["group_index"]]
-                if not structure or structure[0] == 0:
-                    continue
-                fidx = spec["field_index"]
-                for inst in structure[1]:
-                    if fidx >= len(inst):
+            if i < len(structure_labels):
+                sample_labels = structure_labels[i]
+                for qid, spec in enumerate(specs):
+                    group_index = spec["group_index"]
+                    if group_index >= len(sample_labels):
                         continue
-                    for (s, e_inc) in _iter_inclusive_spans(inst[fidx]):
-                        if 0 <= s <= e_inc < length:
-                            mentions.append(MentionTarget(qid, s, e_inc + 1))
+                    structure = sample_labels[group_index]
+                    if not structure or (isinstance(structure, (list, tuple)) and structure[0] == 0):
+                        continue
+                    if isinstance(structure, (int, float)):
+                        continue
+                    fidx = spec["field_index"]
+                    instances = structure[1] if len(structure) > 1 else []
+                    for inst in instances:
+                        if fidx >= len(inst):
+                            continue
+                        for (s, e_inc) in _iter_inclusive_spans(inst[fidx]):
+                            if 0 <= s <= e_inc < length:
+                                mentions.append(MentionTarget(qid, s, e_inc + 1))
             graphs.append(TargetGraph(mentions=tuple(mentions)))
             query_counts.append(len(specs))
             text_lengths.append(length)
@@ -1375,8 +1702,17 @@ class BoundaryExtractorModel(BaseExtractorModel):
             return total
         label_count = 0
         for i in range(len(batch)):
+            if i >= len(structure_labels):
+                continue
             for cls in core["cls_specs"][i]:
-                labels_raw = structure_labels[i][cls["group_index"]]
+                group_index = cls["group_index"]
+                if group_index >= len(structure_labels[i]):
+                    continue
+                labels_raw = structure_labels[i][group_index]
+                if not labels_raw or (isinstance(labels_raw, (int, float)) and labels_raw == 0):
+                    continue
+                if isinstance(labels_raw, (list, tuple)) and len(labels_raw) >= 2 and isinstance(labels_raw[0], int) and isinstance(labels_raw[1], list):
+                    continue
                 choice_states = (
                     cls["choice_states"]
                     if "choice_states" in cls else cls["group_embs"][1:]
@@ -1384,11 +1720,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 logits = self.classifier(choice_states).squeeze(-1)
                 labels = torch.tensor(labels_raw, dtype=logits.dtype, device=device)
                 if labels.shape != logits.shape:
-                    raise ValueError(
-                        f"classification label/logit shape mismatch for sample "
-                        f"{i}, group {cls['group_index']}: labels "
-                        f"{tuple(labels.shape)} vs logits {tuple(logits.shape)}"
-                    )
+                    continue
                 total = total + F.binary_cross_entropy_with_logits(
                     logits, labels, reduction="sum"
                 )
@@ -1458,26 +1790,44 @@ class BoundaryExtractorModel(BaseExtractorModel):
             core["text_states"], relation_states, candidates, pairs
         )
         if not isinstance(edge_targets, tuple):
-            # Legacy/fallback batches have no collator-built relation tensor.
-            # They retain a safe zero-touch path instead of performing
-            # host-side per-pair membership tests.
             return logits.sum() * 0.0
         gold_pairs, gold_mask = edge_targets[:2]
+        if pairs.relation_index.numel() == 0:
+            return logits.sum() * 0.0
+        max_rel_dim = gold_pairs.shape[1]
+        if max_rel_dim == 0 or gold_pairs.shape[0] == 0:
+            return logits.sum() * 0.0
+        safe_rel_idx, valid_rel = safe_relation_indices(
+            pairs.relation_index, max_rel_dim
+        )
+        safe_batch_idx = pairs.batch_index.clamp(
+            min=0, max=gold_pairs.shape[0] - 1
+        )
+        valid_batch = (
+            (pairs.batch_index >= 0)
+            & (pairs.batch_index < gold_pairs.shape[0])
+        )
         pair_coords = torch.stack(
             (pairs.head_start, pairs.head_end, pairs.tail_start, pairs.tail_end),
             dim=-1,
         )
-        selected_gold = gold_pairs[pairs.batch_index, pairs.relation_index]
-        selected_mask = gold_mask[pairs.batch_index, pairs.relation_index]
+        selected_gold = gold_pairs[safe_batch_idx, safe_rel_idx]
+        selected_mask = gold_mask[safe_batch_idx, safe_rel_idx]
+        selected_mask = selected_mask & (valid_rel & valid_batch).unsqueeze(-1)
         labels = (
             (pair_coords.unsqueeze(1) == selected_gold).all(-1)
             & selected_mask
         ).any(-1).to(logits.dtype)
+        if labels.shape != logits.shape:
+            labels = labels.view_as(logits) if labels.numel() == logits.numel() else labels[:logits.shape[0]]
         pair_mask = (
             pairs.pair_mask
             if pairs.pair_mask is not None
             else torch.ones_like(labels, dtype=torch.bool)
         )
+        pair_mask = pair_mask & valid_rel & valid_batch
+        if pair_mask.shape != logits.shape:
+            pair_mask = pair_mask[:logits.shape[0]] if pair_mask.numel() >= logits.numel() else torch.ones_like(logits, dtype=torch.bool)
         loss = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
         loss = (loss * pair_mask.to(loss.dtype)).sum() / pair_mask.sum().clamp_min(1)
         return self.boundary_settings.relation_loss_weight * loss
@@ -1500,6 +1850,15 @@ class BoundaryExtractorModel(BaseExtractorModel):
         if targets is None and self.training:
             targets = self._targets_from_structure(batch, core)
         if targets is not None:
+            target_lengths = core["text_lengths"].to(
+                targets.mention_pairs.device
+            )
+            validate_masked_spans(
+                targets.mention_pairs,
+                targets.mention_mask,
+                target_lengths,
+                name="mention_pairs",
+            )
             # Move to the model device regardless of origin: collator targets
             # arrive on CPU, and the fallback path (_targets_from_structure ->
             # pad_target_graphs) also allocates on CPU. Either must meet the
@@ -1514,6 +1873,12 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 gold_injection_prob=gold_injection_prob,
                 collect_diagnostics=collect_diagnostics,
             )
+            if output.candidates is not None:
+                validate_candidate_indices(
+                    output.candidates.indices,
+                    output.candidates.valid_mask,
+                    core["text_lengths"],
+                )
         else:
             # Classification-only batch: no extractive queries to score.
             output = ExtractorOutput(
@@ -1524,7 +1889,7 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 batch_size=len(batch),
             )
 
-        cls_loss = self._classification_loss(batch, core)
+        cls_loss = _finite_loss_term(self._classification_loss(batch, core))
 
         record_loss = None
         if (
@@ -1535,12 +1900,49 @@ class BoundaryExtractorModel(BaseExtractorModel):
             and output.candidates is not None
             and output.candidates.candidate_states is not None
         ):
-            record_loss = self._record_loss(batch, core, output.candidates, targets)
+            try:
+                record_loss = self._record_loss(batch, core, output.candidates, targets)
+            except RuntimeError as exc:
+                if is_fatal_device_error(exc):
+                    raise
+                logger.warning(
+                    "Dropped record auxiliary loss after RuntimeError: %s", exc
+                )
+                record_loss = None
+            except (IndexError, ValueError) as exc:
+                logger.warning(
+                    "Dropped record auxiliary loss after %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                record_loss = None
         relation_loss = None
         if self.enable_relations and self.training and output.candidates is not None:
-            relation_loss = self._relation_loss(
-                batch, core, output.candidates, targets
-            )
+            try:
+                relation_loss = self._relation_loss(
+                    batch, core, output.candidates, targets
+                )
+            except RuntimeError as exc:
+                if is_fatal_device_error(exc):
+                    raise
+                logger.warning(
+                    "Dropped relation auxiliary loss after RuntimeError: %s", exc
+                )
+                relation_loss = None
+            except (IndexError, ValueError) as exc:
+                logger.warning(
+                    "Dropped relation auxiliary loss after %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                relation_loss = None
+        if record_loss is not None:
+            record_loss = {
+                name: _finite_loss_term(value)
+                for name, value in record_loss.items()
+            }
+        if relation_loss is not None:
+            relation_loss = _finite_loss_term(relation_loss)
 
         # Explicit supervision flag. ``bool(tensor)`` on a loss is wrong in
         # principle (a device sync that also conflates "zero loss" with "no
@@ -1554,7 +1956,11 @@ class BoundaryExtractorModel(BaseExtractorModel):
             or relation_loss is not None
         )
         if has_supervision:
-            span_total = output.total_loss if output.total_loss is not None else torch.zeros((), device=cls_loss.device)
+            span_total = (
+                _finite_loss_term(output.total_loss)
+                if output.total_loss is not None
+                else torch.zeros((), device=cls_loss.device)
+            )
             combined = span_total + cls_loss + self._head_touch(cls_loss.device)
             if record_loss is not None:
                 combined = combined + record_loss["total"]
@@ -1605,9 +2011,16 @@ class BoundaryExtractorModel(BaseExtractorModel):
                 & packed_mask.unsqueeze(-1)
             ).any(-2)
             gold_indicator &= dense.field_membership.unsqueeze(2)
-            losses = compute_dense_batch_loss(
-                dense, gold_indicator, record_mask
-            )
+            try:
+                losses = compute_dense_batch_loss(
+                    dense, gold_indicator, record_mask
+                )
+            except TargetCapacityError:
+                return {
+                    "total": obj_total,
+                    "object": obj_total,
+                    "field": field_total,
+                }
             object_mean = losses["object_loss"]
             field_mean = losses["field_loss"]
             return {
@@ -1628,38 +2041,41 @@ class BoundaryExtractorModel(BaseExtractorModel):
             query_states_i = core["query_states"][i]
             for group_index, (task_index, spec) in enumerate(specs.items()):
                 recs = [r for r in sample_records if r.task_index == task_index]
-                if self.boundary_settings.candidate_pool == "shared":
-                    group = self.record_decoder.forward_group_dense(
-                        spec, query_states_i, candidates, i
-                    )
-                    gold_indicator = None
-                    if isinstance(packed_records, tuple):
-                        packed_spans, packed_mask, _ = packed_records[:3]
-                        spans = packed_spans[
-                            i, group_index, :len(recs), :len(spec.fields)
-                        ]
-                        span_mask = packed_mask[
-                            i, group_index, :len(recs), :len(spec.fields)
-                        ]
-                        gold_indicator = (
-                            (
-                                spans.unsqueeze(-2)
-                                == group.pool_spans[None, None, None, :, :]
-                            ).all(-1)
-                            & span_mask.unsqueeze(-1)
-                        ).any(-2)
-                        gold_indicator = (
-                            gold_indicator
-                            & group.field_membership.unsqueeze(0)
+                try:
+                    if self.boundary_settings.candidate_pool == "shared":
+                        group = self.record_decoder.forward_group_dense(
+                            spec, query_states_i, candidates, i
                         )
-                    losses = compute_dense_group_loss(
-                        group, recs, gold_indicator=gold_indicator
-                    )
-                else:
-                    group = self.record_decoder.forward_group(
-                        spec, query_states_i, candidates, i
-                    )
-                    losses = compute_group_loss(group, recs)
+                        gold_indicator = None
+                        if isinstance(packed_records, tuple):
+                            packed_spans, packed_mask, _ = packed_records[:3]
+                            spans = packed_spans[
+                                i, group_index, :len(recs), :len(spec.fields)
+                            ]
+                            span_mask = packed_mask[
+                                i, group_index, :len(recs), :len(spec.fields)
+                            ]
+                            gold_indicator = (
+                                (
+                                    spans.unsqueeze(-2)
+                                    == group.pool_spans[None, None, None, :, :]
+                                ).all(-1)
+                                & span_mask.unsqueeze(-1)
+                            ).any(-2)
+                            gold_indicator = (
+                                gold_indicator
+                                & group.field_membership.unsqueeze(0)
+                            )
+                        losses = compute_dense_group_loss(
+                            group, recs, gold_indicator=gold_indicator
+                        )
+                    else:
+                        group = self.record_decoder.forward_group(
+                            spec, query_states_i, candidates, i
+                        )
+                        losses = compute_group_loss(group, recs)
+                except (TargetCapacityError, ValueError, IndexError):
+                    continue
                 group_object_count = int(losses.get("object_count", 1))
                 group_field_count = int(losses.get("field_count", 1))
                 obj_total = (
@@ -1702,13 +2118,45 @@ class BoundaryExtractorModel(BaseExtractorModel):
         }
         return output.candidates, aux
 
+    def score_explicit_spans(
+        self,
+        encoded: EncodedBatch,
+        indices: torch.LongTensor,
+        valid_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
+        """Score explicit spans in an already encoded batch.
+
+        This architecture-aware public primitive bypasses proposal top-k while
+        preserving the checkpoint's proposal compatibility and pair reranker.
+        """
+        return self.boundary_head.score_explicit_spans(
+            encoded.text_states,
+            encoded.text_mask,
+            encoded.query_states,
+            encoded.query_mask,
+            indices,
+            valid_mask,
+        )
+
     # =========================================================================
     # Serialization
     # =========================================================================
 
+    def push_to_hub(self, repo_id: str, private: bool = True):
+        """Save and upload this boundary checkpoint to the Hugging Face Hub."""
+        from huggingface_hub import HfApi
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            self.save_pretrained(tmp_dir)
+            api = HfApi()
+            api.create_repo(repo_id=repo_id, private=private, exist_ok=True)
+            return api.upload_folder(repo_id=repo_id, folder_path=tmp_dir)
+
     def save_pretrained(self, save_directory: str, **kwargs):
         from safetensors.torch import save_file
 
+        if self.encoder is None:
+            raise ValueError("cannot save a boundary model built with load_encoder=False")
         os.makedirs(save_directory, exist_ok=True)
         self.config.architecture = "boundary"
         self.config.architectures = [type(self).__name__]
@@ -1723,33 +2171,44 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
     @classmethod
     def from_pretrained(cls, repo_or_dir: str, **kwargs):
-        from safetensors.torch import load_file
-        from huggingface_hub import hf_hub_download
-
         config = kwargs.pop("config", None)
-        map_location = kwargs.pop("map_location", None)
-        compile_model = kwargs.pop("compile", False)
-
-        def download_or_local(repo, filename):
-            if os.path.isdir(repo):
-                return os.path.join(repo, filename)
-            return hf_hub_download(repo, filename)
+        model_options, hub_kwargs = split_load_kwargs(
+            kwargs, context=f"{cls.__name__}.from_pretrained"
+        )
+        quantize = model_options.pop("quantize", False)
+        compile_model = model_options.pop("compile", False)
+        map_location = model_options.pop("map_location", None)
+        attention_backend, use_flashdeberta = pop_attention_backend(
+            model_options
+        )
+        disentangled_flash_options = pop_disentangled_flash_options(model_options)
+        word_splitter = model_options.pop("word_splitter", None)
 
         if config is None:
-            config = cls.config_class.from_pretrained(download_or_local(repo_or_dir, "config.json"))
-        encoder_config = AutoConfig.from_pretrained(
-            download_or_local(repo_or_dir, "encoder_config/config.json")
-        )
-        tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
-        model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
-
-        try:
-            state_dict = load_file(download_or_local(repo_or_dir, "model.safetensors"))
-        except Exception:
-            state_dict = torch.load(
-                download_or_local(repo_or_dir, "pytorch_model.bin"),
-                map_location="cpu", weights_only=True,
+            config = cls.config_class.from_pretrained(
+                checkpoint_file(repo_or_dir, "config.json", hub_kwargs)
             )
+        encoder_config = AutoConfig.from_pretrained(
+            checkpoint_file(
+                repo_or_dir, "encoder_config/config.json", hub_kwargs
+            )
+        )
+        tokenizer_source = repo_or_dir
+        if os.path.isdir(str(repo_or_dir)) and hub_kwargs.get("subfolder"):
+            tokenizer_source = os.path.join(
+                str(repo_or_dir), str(hub_kwargs["subfolder"])
+            )
+        tokenizer = load_extractor_tokenizer(tokenizer_source)
+        model = cls(
+            config,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            use_flashdeberta=use_flashdeberta,
+            word_splitter=word_splitter,
+        )
+
+        state_dict = load_checkpoint_state_dict(repo_or_dir, hub_kwargs)
+        reconcile_encoder_embeddings(model, state_dict)
         try:
             model.load_state_dict(state_dict)
         except RuntimeError as exc:
@@ -1769,11 +2228,15 @@ class BoundaryExtractorModel(BaseExtractorModel):
 
         model.config._name_or_path = repo_or_dir
         model.name_or_path = repo_or_dir
-        if map_location is not None:
-            model = model.to(map_location)
-        if compile_model:
-            model.compile(dynamic=True)
-        return model
+        return apply_post_load_options(
+            model,
+            map_location=map_location,
+            quantize=quantize,
+            compile_model=compile_model,
+            compile_dynamic=True,
+            attention_backend=attention_backend,
+            disentangled_flash_options=disentangled_flash_options,
+        )
 
 
 __all__ = [

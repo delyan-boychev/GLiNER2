@@ -265,7 +265,10 @@ def compile_record_specs(
             card = (
                 FieldCardinality(card_raw)
                 if card_raw is not None
-                else _default_cardinality(None, is_anchor)
+                else _default_cardinality(
+                    (field_dtypes or {}).get(name, {}).get(q.role_name),
+                    is_anchor,
+                )
             )
             fields.append(
                 RecordFieldSpec(

@@ -5,6 +5,7 @@ import torch
 
 from gliner2.joint_ie import JointIE, JointIEConfig, RawScorer
 from gliner2.joint_ie.schema import JointSchema
+from gliner2.models.base import BaseExtractorModel
 
 
 class FakeBatch:
@@ -64,6 +65,8 @@ class FakeEncoder(torch.nn.Module):
 
 
 class FakeModel(torch.nn.Module):
+    encode_tokens = BaseExtractorModel.encode_tokens
+
     def __init__(self):
         super().__init__()
         self.encoder = FakeEncoder()
@@ -146,9 +149,23 @@ def test_from_pretrained_splits_wrapper_and_model_options(monkeypatch):
             captured.update(path=path, kwargs=kwargs)
             return FakeModel()
 
-    monkeypatch.setattr(gliner2, "GLiNER2", Loader)
-    engine = JointIE.from_pretrained("repo", quantize=True, map_location="cpu")
-    assert captured == {"path": "repo", "kwargs": {"quantize": True, "map_location": "cpu"}}
+    monkeypatch.setattr(gliner2, "AutoExtractor", Loader)
+    engine = JointIE.from_pretrained(
+        "repo",
+        quantize=True,
+        map_location="cpu",
+        revision="release",
+        use_flashdeberta=False,
+    )
+    assert captured == {
+        "path": "repo",
+        "kwargs": {
+            "quantize": True,
+            "map_location": "cpu",
+            "revision": "release",
+            "use_flashdeberta": False,
+        },
+    }
     assert engine.model is not None
     with pytest.raises(TypeError, match="JointIEConfig"):
         JointIE.from_pretrained("repo", beam_size=4)

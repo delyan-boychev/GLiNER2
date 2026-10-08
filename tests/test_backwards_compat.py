@@ -163,6 +163,15 @@ def test_save_adapter_directory_shape(tmp_path) -> None:
 # Proof 3 — Numeric equivalence (legacy oracle replay)
 # =========================================================================
 
+def test_legacy_oracle_provenance() -> None:
+    """Binary fixtures must come from the last published release."""
+    provenance = json.loads((FIXTURE_DIR / "oracle_provenance.json").read_text())
+    assert provenance["reference_package"] == "gliner2"
+    assert provenance["reference_version"] == "1.3.2"
+    assert provenance["seed_model"] == 42
+    assert provenance["seed_input"] == 314159
+
+
 def test_legacy_adapter_forward_matches_oracle() -> None:
     """Loading the legacy golden adapter and replaying the oracle input
     produces outputs within tolerance of the legacy forward."""

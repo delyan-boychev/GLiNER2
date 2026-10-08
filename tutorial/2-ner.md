@@ -16,10 +16,10 @@ Learn how to extract named entities from text using GLiNER2's flexible entity re
 ### Simple Example
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
-# Load model
-extractor = GLiNER2.from_pretrained("your-model-name")
+# GLiNER2.5 boundary checkpoint (English)
+extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Extract common entities
 text = "Apple Inc. CEO Tim Cook announced the new iPhone 15 in Cupertino, California on September 12, 2023."

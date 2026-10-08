@@ -35,6 +35,16 @@ def test_per_query_reduction_is_invariant_to_other_query_length():
     assert not torch.allclose(_two_query_loss(4, "global"), _two_query_loss(64, "global"))
 
 
+def test_sum_reduction_returns_masked_loss_sum():
+    logits = torch.zeros(1, 1, 3)
+    targets = torch.zeros_like(logits)
+    valid = torch.tensor([[[True, False, True]]])
+
+    loss = balanced_multilabel_bce(logits, targets, valid, reduction="sum")
+
+    assert torch.allclose(loss, 2 * torch.log(torch.tensor(2.0)))
+
+
 def test_focal_negative_weight_is_applied():
     logits = torch.zeros(1, 1, 4)
     targets = torch.tensor([[[1.0, 0.0, 0.0, 0.0]]])

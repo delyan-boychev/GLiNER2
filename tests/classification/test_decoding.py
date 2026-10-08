@@ -4,13 +4,16 @@ infeasibility ladder in order. No torch.
 """
 from __future__ import annotations
 
+import random
 from types import SimpleNamespace
 
 import pytest
 
 from gliner2.classification import constraints as C
 from gliner2.classification.compiler import compile_schema
+from gliner2.classification.constraints import DictAssignment
 from gliner2.classification.decoding import (
+    BeamDecoder,
     ExactDecoder,
     IndependentDecoder,
     MinViolationsDecoder,
@@ -76,6 +79,81 @@ def test_exact_matches_independent_when_unbound():
     indep = IndependentDecoder().decode(problem)
     assert exact.assignments["intent"].labels == indep.assignments["intent"].labels
     assert exact.assignments["effects"].labels == indep.assignments["effects"].labels
+
+
+# ---- T-D4b : a satisfied constraint never changes the answer -----------
+#
+# Retention runs at the engine default (candidate_threshold=0.5), where the
+# argmax of an exclusive task can sit below the floor. A label a constraint
+# rescues must not stand in for the labels the unconstrained decode keeps.
+
+_INTENT = ["read", "write", "delete"]
+_EFFECTS = ["read_only", "create", "modify", "delete"]
+# "DROP TABLE customers;" on gliner2-base-v1: no intent label clears 0.5.
+_DROP_TABLE = {"intent": {"read": -1.921, "write": -0.039, "delete": -3.941},
+               "effects": {"read_only": -3.252, "create": -0.286,
+                           "modify": -0.252, "delete": -2.910}}
+
+
+def _intent_effects(*constraints):
+    return compile_schema(ClassificationSchema()
+                          .single("intent", _INTENT)
+                          .multi("effects", _EFFECTS)
+                          .constrain(*constraints))
+
+
+def _labels(sol):
+    return {t: la.labels for t, la in sol.assignments.items()}
+
+
+def _decode_at_default_retention(compiled, tasks, decoder):
+    cfg = _cfg(decoder=decoder, candidate_threshold=0.5, on_infeasible="raise")
+    return decode(_problem(compiled, tasks, cfg), cfg)
+
+
+def test_vacuous_implies_keeps_the_unconstrained_optimum():
+    free = _decode_at_default_retention(_intent_effects(), _DROP_TABLE, "auto")
+    compiled = _intent_effects(C.implies(("intent", "delete"), ("effects", "delete")))
+    bound = _decode_at_default_retention(compiled, _DROP_TABLE, "exact")
+    assert _labels(free) == {"intent": frozenset({"write"}), "effects": frozenset()}
+    assert _labels(bound) == _labels(free)
+    assert bound.score == pytest.approx(free.score)
+    assert bound.exact and bound.feasible
+
+
+@pytest.mark.parametrize("constraint", [
+    C.implies(("intent", "delete"), ("effects", "delete")),   # effects is consequent
+    C.implies(("effects", "delete"), ("intent", "delete")),   # effects is antecedent
+])
+def test_implies_allows_an_empty_multi_label_set(constraint):
+    # every label below the floor; the argmax (write) is still the answer
+    tasks = {"intent": {"read": -2.0, "write": -0.2, "delete": -3.0},
+             "effects": dict.fromkeys(_EFFECTS, -2.5)}
+    sol = _decode_at_default_retention(_intent_effects(constraint), tasks, "exact")
+    assert _labels(sol) == {"intent": frozenset({"write"}), "effects": frozenset()}
+
+
+def test_satisfied_implies_never_changes_the_answer_over_random_scores():
+    rng = random.Random(7622)
+    checked = 0
+    for _ in range(300):
+        tasks = {"intent": {name: rng.uniform(-4.0, 1.5) for name in _INTENT},
+                 "effects": {name: rng.uniform(-4.0, 3.0) for name in _EFFECTS}}
+        if rng.random() < 0.5:
+            cond, then = ("intent", rng.choice(_INTENT)), ("effects", rng.choice(_EFFECTS))
+        else:
+            cond, then = ("effects", rng.choice(_EFFECTS)), ("intent", rng.choice(_INTENT))
+        constraint = C.implies(cond, then)
+        free = _decode_at_default_retention(_intent_effects(), tasks, "auto")
+        compiled = _intent_effects(constraint)
+        a = DictAssignment(compiled, _labels(free), decided=compiled.task_order)
+        if not constraint.satisfied(a):
+            continue
+        bound = _decode_at_default_retention(compiled, tasks, "exact")
+        assert _labels(bound) == _labels(free), (constraint, tasks)
+        assert bound.score == pytest.approx(free.score)
+        checked += 1
+    assert checked > 150
 
 
 # ---- T-D9 : auto decoder selection -------------------------------------
@@ -197,6 +275,53 @@ def test_beam_fallback_matches_exact_on_small_problem():
     assert beam_sol.feasible
     assert beam_sol.assignments["intent"].labels == exact_sol.assignments["intent"].labels
     assert beam_sol.assignments["effects"].labels == exact_sol.assignments["effects"].labels
+
+
+# ---- B2 : a beam dead end is "no feasible assignment", never feasible ---
+
+def _beam_dead_end():
+    # a=x requires b=p and b=q at once, so a=x has no feasible completion while
+    # a=y does. beam_size=1 keeps only the higher-utility a=x.
+    schema = (ClassificationSchema()
+              .single("a", ["x", "y"])
+              .single("b", ["p", "q"])
+              .constrain(C.implies(("a", "x"), ("b", "p")),
+                         C.implies(("a", "x"), ("b", "q"))))
+    compiled = compile_schema(schema)
+    tasks = {"a": {"x": 3.0, "y": 0.0}, "b": {"p": 2.0, "q": 1.0}}
+    return compiled, tasks
+
+
+def test_beam_dead_end_returns_none():
+    compiled, tasks = _beam_dead_end()
+    cfg = _cfg(decoder="exact")
+    assert BeamDecoder().decode(_problem(compiled, tasks, cfg), beam_size=1) is None
+
+
+def test_budget_exhausted_beam_dead_end_raises_infeasible_error():
+    compiled, tasks = _beam_dead_end()
+    cfg = _cfg(decoder="exact", exact_node_budget=1, beam_size=1, on_infeasible="raise")
+    with pytest.raises(InfeasibleError):
+        decode(_problem(compiled, tasks, cfg), cfg)
+
+
+@pytest.mark.parametrize("mode", ["relax", "min_violations"])
+def test_budget_exhausted_beam_dead_end_walks_the_infeasibility_ladder(mode):
+    compiled, tasks = _beam_dead_end()
+    cfg = _cfg(decoder="exact", exact_node_budget=1, beam_size=1, on_infeasible=mode)
+    problem = _problem(compiled, tasks, cfg)
+    sol = decode(problem, cfg, widen=lambda: problem)
+    assert set(sol.assignments) == {"a", "b"}   # complete assignment, never {}
+    assert sol.exact is False                   # the search was cut short
+
+
+# ---- B3 : min_violations is exact only when the search completed -------
+
+def test_min_violations_is_not_exact_when_budget_is_exhausted():
+    compiled, tasks = _hard_infeasible()
+    problem = _problem(compiled, tasks, _cfg(on_infeasible="min_violations"))
+    assert MinViolationsDecoder().decode(problem).exact is True
+    assert MinViolationsDecoder().decode(problem, budget=1).exact is False
 
 
 # ---- T-D7 : active masking drops constraints ---------------------------

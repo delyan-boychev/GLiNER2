@@ -18,6 +18,7 @@ from typing import Any, Optional
 import torch
 
 from ..joint_ie.calibration import Calibrator
+from ..models.loading import LOAD_OPTIONS
 from .compiler import CompiledClassificationSchema, compile_schema, _fingerprint
 from .decoding import build_problem, decode as _decode
 from .errors import SchemaError
@@ -27,7 +28,7 @@ from .scoring import ClassificationScorer
 
 _DECODERS = ("auto", "independent", "exact", "beam")
 _ON_INFEASIBLE = ("relax", "min_violations", "raise")
-_MODEL_LOAD_OPTIONS = frozenset({"quantize", "compile", "map_location"})
+_MODEL_LOAD_OPTIONS = LOAD_OPTIONS
 _CACHE_CAP = 128
 
 
@@ -80,7 +81,7 @@ class Classifier:
     @classmethod
     def from_pretrained(cls, repo_or_dir: str, *, device=None, dtype=None,
                         **kwargs) -> "Classifier":
-        from gliner2 import GLiNER2
+        from gliner2 import AutoExtractor
         unknown = sorted(set(kwargs) - _MODEL_LOAD_OPTIONS)
         if unknown:
             raise TypeError(
@@ -88,7 +89,7 @@ class Classifier:
                 f"belong in ClassificationConfig(...) passed as config= per call. "
                 f"from_pretrained accepts only {sorted(_MODEL_LOAD_OPTIONS)}."
             )
-        model = GLiNER2.from_pretrained(repo_or_dir, **kwargs)
+        model = AutoExtractor.from_pretrained(repo_or_dir, **kwargs)
         return cls(model, device=device, dtype=dtype)
 
     # ---- lifecycle -----------------------------------------------------
@@ -137,12 +138,30 @@ class Classifier:
         compiled = self.compile_schema(schema)
         return self.scorer.score(text, compiled, max_len=config.max_len)
 
+    def _compile_each(self, schema):
+        if isinstance(schema, (list, tuple)):
+            return [self.compile_schema(s) for s in schema]
+        return self.compile_schema(schema)
+
     @torch.inference_mode()
-    def batch_score(self, texts, schema, *, config: Optional[ClassificationConfig] = None):
+    def batch_score(self, texts, schema, *, config: Optional[ClassificationConfig] = None,
+                    hidden_states=None):
+        """Score texts against one schema or one schema per text.
+
+        Args:
+            texts: Input texts.
+            schema: A schema for every text, or a list with one per text.
+            config: Prediction controls.
+            hidden_states: Optional precomputed encoder output, one tensor per text.
+
+        Returns:
+            One ``ClassificationScores`` per text.
+        """
         config = config or ClassificationConfig()
-        compiled = self.compile_schema(schema)
-        return self.scorer.batch_score(texts, compiled, batch_size=config.batch_size,
-                                       max_len=config.max_len)
+        return self.scorer.batch_score(texts, self._compile_each(schema),
+                                       batch_size=config.batch_size,
+                                       max_len=config.max_len,
+                                       hidden_states=hidden_states)
 
     # ---- decoding ------------------------------------------------------
 
@@ -178,11 +197,28 @@ class Classifier:
 
     @torch.inference_mode()
     def batch_classify(self, texts, schema, *, active=None,
-                       config: Optional[ClassificationConfig] = None):
+                       config: Optional[ClassificationConfig] = None,
+                       hidden_states=None):
+        """Classify texts against one schema or one schema per text.
+
+        Args:
+            texts: Input texts.
+            schema: A schema for every text, or a list with one per text.
+            active: Optional subset of tasks to decode.
+            config: Prediction controls.
+            hidden_states: Optional precomputed encoder output, one tensor per text.
+
+        Returns:
+            One decoded classification result per text.
+        """
         config = config or ClassificationConfig()
-        scores_list = self.batch_score(texts, schema, config=config)
-        return [self.decode(scores, schema, active=active, config=config)
-                for scores in scores_list]
+        texts = list(texts)
+        compiled = self._compile_each(schema)
+        scores_list = self.batch_score(texts, compiled, config=config,
+                                       hidden_states=hidden_states)
+        per_text = compiled if isinstance(compiled, list) else [compiled] * len(texts)
+        return [self.decode(scores, one, active=active, config=config)
+                for scores, one in zip(scores_list, per_text, strict=True)]
 
     @torch.inference_mode()
     def classify_long(self, text: str, schema, *, active=None,

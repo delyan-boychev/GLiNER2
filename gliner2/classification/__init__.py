@@ -9,7 +9,7 @@ Public surface (9 names). The constraint DSL is the ``constraints`` submodule::
               .single("intent", ["read", "write", "delete"])
               .multi("effects", ["read_only", "create", "modify", "delete"])
               .constrain(C.implies(("intent", "delete"), ("effects", "delete"))))
-    clf = Classifier.from_pretrained("fastino/gliner2-base-v1")
+    clf = Classifier.from_pretrained("fastino/gliner2.5-base-v1")
     result = clf.classify("rm -rf /", schema)
 """
 from __future__ import annotations

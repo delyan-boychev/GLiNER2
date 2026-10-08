@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
+from gliner2.configuration import BoundaryHeadSettings
 from gliner2.models.boundary.heads import BoundaryQueryHead
+from gliner2.models.boundary.model import BoundaryHead
 from gliner2.models.boundary.proposal import ProposalSettings, SparseBoundaryProposer
 from gliner2.models.boundary.scoring import (
     SparseBoundaryPairScorer,
@@ -81,3 +84,48 @@ def test_scorer_finite_gradients():
     assert boundary_states.grad is not None
     assert torch.isfinite(boundary_states.grad).all()
     assert torch.isfinite(query_states.grad).all()
+
+
+@pytest.mark.parametrize("candidate_pool", ["per_query", "shared"])
+def test_explicit_span_scoring_matches_selected_candidate_logits(candidate_pool):
+    torch.manual_seed(19)
+    settings = BoundaryHeadSettings(
+        boundary_dim=8,
+        pair_dim=8,
+        start_top_k=4,
+        end_top_k=4,
+        ends_per_start=3,
+        starts_per_end=3,
+        candidate_budget=8,
+        training_candidate_budget=12,
+        max_gold_per_query=6,
+        end_block_size=4,
+        dropout=0.0,
+        candidate_pool=candidate_pool,
+    )
+    head = BoundaryHead(8, settings, query_dim=8).eval()
+    token_states = torch.randn(2, 7, 8)
+    text_mask = torch.tensor([
+        [True] * 7,
+        [True] * 5 + [False] * 2,
+    ])
+    query_states = torch.randn(2, 3, 8)
+    query_mask = torch.tensor([
+        [True, True, True],
+        [True, True, False],
+    ])
+
+    output = head(token_states, text_mask, query_states, query_mask)
+    explicit = head.score_explicit_spans(
+        token_states,
+        text_mask,
+        query_states,
+        query_mask,
+        output.candidates.indices,
+        output.candidates.valid_mask,
+    )
+
+    valid = output.candidates.valid_mask & query_mask.unsqueeze(-1)
+    assert torch.allclose(
+        explicit[valid], output.candidates.pair_logits[valid], atol=1e-6
+    )

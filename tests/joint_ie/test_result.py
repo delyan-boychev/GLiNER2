@@ -67,3 +67,38 @@ def test_long_text_remaps_dedupes_and_keeps_relations_chunk_local():
         ("e1", 0, 3), ("e2", 13, 17), ("e3", 22, 25), ("e4", 35, 39)
     ]
     assert all(relation.head in {"e1", "e3"} for relation in result.relations)
+
+
+def test_extract_long_text_uses_model_word_splitter(monkeypatch):
+    from types import SimpleNamespace
+
+    from gliner2.inference.chunking import TextChunk
+
+    sentinel = object()
+    captured = {}
+
+    def fake_split(text, chunk_size=384, chunk_overlap=64, word_splitter=None):
+        captured["word_splitter"] = word_splitter
+        return [
+            TextChunk(
+                text=text,
+                start_char=0,
+                end_char=len(text),
+                start_word=0,
+                end_word=1,
+            )
+        ]
+
+    monkeypatch.setattr("gliner2.joint_ie.long_text.split_text_into_chunks", fake_split)
+
+    class Engine:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                processor=SimpleNamespace(word_splitter=sentinel)
+            )
+
+        def extract_joint(self, text, include_confidence=True, include_spans=True):
+            return JointResult(text, [], [])
+
+    extract_long_text(Engine(), "hello world", chunk_size=4, chunk_overlap=1)
+    assert captured["word_splitter"] is sentinel

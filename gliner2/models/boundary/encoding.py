@@ -66,7 +66,7 @@ def shift_right_with_eos(
     out[:, l] = eos_state.to(text_states.dtype)
     # Place EOS at each sample's final boundary index n_b.
     eos = eos_state.to(text_states.dtype).view(1, h).expand(b, h)
-    out[torch.arange(b, device=text_states.device), text_lengths] = eos
+    out[torch.arange(b, device=text_states.device), text_lengths.clamp(max=l)] = eos
     return out
 
 

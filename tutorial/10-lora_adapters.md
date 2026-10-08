@@ -49,7 +49,7 @@ LoRA adapters train **2-3x faster** than full fine-tuning because:
 
 ```python
 # One base model, multiple domains
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Legal domain
 model.load_adapter("./legal_adapter")
@@ -91,8 +91,8 @@ legal_examples = [
 ### Step 2: Configure LoRA Training
 
 ```python
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # LoRA configuration
 config = TrainingConfig(
@@ -126,10 +126,10 @@ config = TrainingConfig(
 
 ```python
 # Load base model
-base_model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+base_model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Create trainer
-trainer = GLiNER2Trainer(model=base_model, config=config)
+trainer = ExtractorTrainer(model=base_model, config=config)
 
 # Train adapter
 trainer.train(train_data=legal_examples)
@@ -169,8 +169,8 @@ Let's train adapters for three different domains: **Legal**, **Medical**, and **
 ### Complete Multi-Domain Training Script
 
 ```python
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 from gliner2.training.data import InputExample
 
 # ============================================================================
@@ -271,8 +271,8 @@ def train_domain_adapter(
     print(f"Training {domain_name.upper()} adapter")
     print(f"{'='*60}")
     
-    model = GLiNER2.from_pretrained(base_model_name)
-    trainer = GLiNER2Trainer(model=model, config=config)
+    model = AutoExtractor.from_pretrained(base_model_name)
+    trainer = ExtractorTrainer(model=model, config=config)
     
     # Train
     results = trainer.train(train_data=examples)
@@ -316,10 +316,10 @@ if __name__ == "__main__":
 ### Basic Usage
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
 # Load base model once
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Load legal adapter
 model.load_adapter("./adapters/legal_adapter/final")
@@ -336,7 +336,7 @@ print(result)
 
 ```python
 # Load base model
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Legal domain
 print("📋 Legal Analysis:")
@@ -426,7 +426,7 @@ def get_entity_types(domain):
     return types.get(domain, ["entity"])
 
 # Example usage
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 documents_by_domain = {
     "legal": [
@@ -472,7 +472,7 @@ class MultiTenantEntityExtractor:
             base_model_name: Path to base model
             tenant_adapters: Dict mapping tenant_id to adapter_path
         """
-        self.model = GLiNER2.from_pretrained(base_model_name)
+        self.model = AutoExtractor.from_pretrained(base_model_name)
         self.tenant_adapters = tenant_adapters
         self.current_tenant = None
     
@@ -516,7 +516,7 @@ medical_result = extractor.extract_for_tenant(
 ### Use Case 2: Document Classification Pipeline
 
 ```python
-def classify_and_extract(document: str, model: GLiNER2, adapters: dict):
+def classify_and_extract(document: str, model, adapters: dict):
     """
     Classify document type and extract relevant entities.
     
@@ -567,7 +567,7 @@ def classify_and_extract(document: str, model: GLiNER2, adapters: dict):
     }
 
 # Usage
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 adapters = {
     "legal": "./adapters/legal_adapter/final",
@@ -595,7 +595,7 @@ class AdapterABTester:
         Args:
             adapter_variants: {"v1": path1, "v2": path2, ...}
         """
-        self.model = GLiNER2.from_pretrained(base_model_name)
+        self.model = AutoExtractor.from_pretrained(base_model_name)
         self.adapter_variants = adapter_variants
         self.results = {variant: [] for variant in adapter_variants}
     
@@ -746,6 +746,16 @@ lora_target_modules=["encoder", "span_rep", "classifier"]
 # Memory: High (~3-5% of model parameters)
 lora_target_modules=["encoder", "span_rep", "classifier", "count_embed", "count_pred"]
 ```
+
+**GLiNER2.5 boundary checkpoints** — use high-level aliases resolved by architecture:
+
+```python
+model.apply_lora(targets=["encoder", "all_task_heads"])
+# Or selectively:
+# ["extractive_head", "classification_head", "record_head", "relation_head"]
+```
+
+See [Boundary architecture](../docs/boundary_architecture.md#9-advanced--experimental-building-blocks) for the full alias list.
 
 **Recommendations:**
 - **Start with encoder only** (`["encoder"]`) for most tasks
@@ -943,7 +953,7 @@ config = TrainingConfig(
 trainer.train(train_data=examples)
 
 # Loading
-model = GLiNER2.from_pretrained("base-model")
+model = AutoExtractor.from_pretrained("base-model")
 model.load_adapter("./adapter/final")
 
 # Swapping

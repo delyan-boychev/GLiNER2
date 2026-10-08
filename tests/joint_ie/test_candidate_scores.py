@@ -13,7 +13,7 @@ from gliner2.joint_ie.candidate_scores import (
     candidate_score_set_to_problem,
     score_lattice_to_candidate_score_set,
 )
-from gliner2.joint_ie.constraints import TypedEndpoints
+from gliner2.joint_ie.constraints import TypedEndpoints, UniqueRelationSlot
 from gliner2.joint_ie.optimizers import BeamOptimizer, GreedyOptimizer
 
 
@@ -54,6 +54,34 @@ def test_typed_endpoints_and_optimizers_select_relation():
         solution = optimizer.optimize(problem)
         assert {e.relation_type for e in solution.edges} == {"works_for"}
         assert len(solution.nodes) == 2
+
+
+def test_sparse_boundary_edges_receive_distinct_relation_slots():
+    css = CandidateScoreSet(
+        text="A X B Y",
+        mentions=(
+            MentionScore(0, "person", 0, 1, 4.0, 0.98),
+            MentionScore(1, "org", 1, 2, 4.0, 0.98),
+            MentionScore(0, "person", 2, 3, 4.0, 0.98),
+            MentionScore(1, "org", 3, 4, 4.0, 0.98),
+        ),
+        edges=(
+            ScoredRelationEdge(
+                "works_for", ("person", 0, 1), ("org", 1, 2), 4.0, 0.98
+            ),
+            ScoredRelationEdge(
+                "works_for", ("person", 2, 3), ("org", 3, 4), 4.0, 0.98
+            ),
+        ),
+    )
+    problem = candidate_score_set_to_problem(
+        css,
+        constraints=(UniqueRelationSlot("works_for", "slot"),),
+    )
+    solution = GreedyOptimizer().optimize(problem)
+
+    assert len(solution.edges) == 2
+    assert len({edge.slot for edge in solution.edges}) == 2
 
 
 def test_score_lattice_to_candidate_score_set_maps_halfopen_spans():

@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from gliner2.models.base import QueryLayout
 from gliner2.models.outputs import CandidateTensorBatch
+from gliner2.models.boundary.validation import safe_relation_indices
 
 
 @dataclass(frozen=True)
@@ -202,6 +203,8 @@ class TypedRelationPairGenerator:
                 selected_prob = F.pad(selected_prob, (0, pad))
             qslot = torch.div(ranked, cand_count, rounding_mode="floor")
             cslot = ranked - qslot * cand_count
+            qslot = qslot.clamp(0, queries - 1)
+            cslot = cslot.clamp(0, cand_count - 1)
             batch = torch.arange(bsz, device=device)[:, None, None]
             spans = candidates.indices[batch, qslot, cslot]
             return selected_prob, qslot, spans, selected_valid
@@ -226,18 +229,20 @@ class TypedRelationPairGenerator:
             kept_valid = F.pad(kept_valid, (0, s.pair_cap - take), value=False)
         hi = torch.div(keep, s.tails_per_relation, rounding_mode="floor")
         ti = keep - hi * s.tails_per_relation
+        hi = hi.clamp(0, s.heads_per_relation - 1)
+        ti = ti.clamp(0, s.tails_per_relation - 1)
 
         def gather_selected(values: torch.Tensor, index: torch.LongTensor):
             return values.gather(
-                2, index.unsqueeze(-1).expand(*index.shape, values.shape[-1])
+                2, index.clamp(0, values.shape[2] - 1).unsqueeze(-1).expand(*index.shape, values.shape[-1])
             )
 
         hs = gather_selected(hspan, hi)
         ts = gather_selected(tspan, ti)
-        hp_out = hp.gather(2, hi)
-        tp_out = tp.gather(2, ti)
-        hq_out = hq.gather(2, hi)
-        tq_out = tq.gather(2, ti)
+        hp_out = hp.gather(2, hi.clamp(0, hp.shape[2] - 1))
+        tp_out = tp.gather(2, ti.clamp(0, tp.shape[2] - 1))
+        hq_out = hq.gather(2, hi.clamp(0, hq.shape[2] - 1))
+        tq_out = tq.gather(2, ti.clamp(0, tq.shape[2] - 1))
         bi = torch.arange(bsz, device=device)[:, None, None].expand_as(keep)
         ri = torch.arange(rel_count, device=device)[None, :, None].expand_as(keep)
 
@@ -330,7 +335,23 @@ class SparseRelationScorer(nn.Module):
         if len(relation_pairs) == 0:
             return boundary_states.new_zeros(0)
 
-        b = relation_pairs.batch_index
+        batch_count = min(
+            boundary_states.shape[0], relation_query_states.shape[0]
+        )
+        if batch_count <= 0 or relation_query_states.shape[1] <= 0:
+            return boundary_states.new_zeros(len(relation_pairs))
+        batch_valid = (
+            (relation_pairs.batch_index >= 0)
+            & (relation_pairs.batch_index < batch_count)
+        )
+        b = relation_pairs.batch_index.clamp(0, batch_count - 1)
+        relation_index, relation_valid = safe_relation_indices(
+            relation_pairs.relation_index,
+            relation_query_states.shape[1],
+        )
+        pair_valid = batch_valid & relation_valid
+        if relation_pairs.pair_mask is not None:
+            pair_valid &= relation_pairs.pair_mask
         length = boundary_states.shape[1]
 
         def gather(pos: torch.Tensor) -> torch.Tensor:
@@ -341,9 +362,14 @@ class SparseRelationScorer(nn.Module):
         h_end = gather(relation_pairs.head_end - 1)
         t_start = gather(relation_pairs.tail_start)
         t_end = gather(relation_pairs.tail_end - 1)
-        rel = relation_query_states[b, relation_pairs.relation_index]
+        rel = relation_query_states[b, relation_index]
 
-        delta = (relation_pairs.tail_start - relation_pairs.head_start).float()
+        # Positional features originate from integer indices; create them in
+        # the activation dtype before concatenating with encoder states so the
+        # relation MLP remains compatible with FP16/BF16 models.
+        delta = (relation_pairs.tail_start - relation_pairs.head_start).to(
+            boundary_states.dtype
+        )
         order = torch.sign(delta).unsqueeze(-1)
         dist = (delta.abs() / float(max(length, 1))).unsqueeze(-1)
 
@@ -381,7 +407,7 @@ class SparseRelationScorer(nn.Module):
                 torch.cat((head_content, tail_content, rel), dim=-1)
             ).squeeze(-1)
             score = score + biaffine + linear
-        return score
+        return score.masked_fill(~pair_valid, 0.0)
 
 
 __all__ = [

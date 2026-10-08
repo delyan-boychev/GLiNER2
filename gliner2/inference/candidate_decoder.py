@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from gliner2.inference.overlap import resolve_overlaps
 from gliner2.models.base import QueryLayout, QuerySpec
 from gliner2.models.candidates import CandidateSet, ScoredSpanCandidate
 
@@ -57,55 +58,18 @@ def stable_candidate_sort_key(
     return (-candidate.probability, candidate.start, candidate.end, query_name)
 
 
-def _spans_overlap(a: ScoredSpanCandidate, b: ScoredSpanCandidate) -> bool:
-    return a.start < b.end and b.start < a.end
-
-
-def _strictly_nested(inner: ScoredSpanCandidate, outer: ScoredSpanCandidate) -> bool:
-    return outer.start <= inner.start and inner.end <= outer.end and (
-        outer.start < inner.start or inner.end < outer.end or inner is outer
-    )
-
-
 def apply_overlap_policy(
     candidates: Sequence[ScoredSpanCandidate],
     policy: str,
 ) -> List[ScoredSpanCandidate]:
-    """Resolve overlaps deterministically within a single query.
-
-    Policies:
-      * ``"allow"``    - keep everything.
-      * ``"nested"``   - keep spans that are either disjoint or fully nested
-        relative to every higher-ranked kept span (reject partial/crossing
-        overlaps only).
-      * ``"disallow"`` - greedy highest-confidence; drop any span overlapping a
-        kept span.
-    """
-    if policy not in ("allow", "nested", "disallow"):
-        raise ValueError(f"unknown overlap_policy {policy!r}")
-    if policy == "allow":
-        return list(candidates)
-
-    ranked = sorted(candidates, key=lambda c: stable_candidate_sort_key(c))
-    kept: List[ScoredSpanCandidate] = []
-    for cand in ranked:
-        ok = True
-        for k in kept:
-            if not _spans_overlap(cand, k):
-                continue
-            if policy == "disallow":
-                ok = False
-                break
-            # nested: allow only if fully contained in / containing k
-            nested = (k.start <= cand.start and cand.end <= k.end) or (
-                cand.start <= k.start and k.end <= cand.end
-            )
-            if not nested:
-                ok = False
-                break
-        if ok:
-            kept.append(cand)
-    return kept
+    """Resolve overlaps deterministically within a single query."""
+    return resolve_overlaps(
+        candidates,
+        policy,
+        score=lambda candidate: candidate.probability,
+        start=lambda candidate: candidate.start,
+        end=lambda candidate: candidate.end,
+    )
 
 
 def decode_candidate_set(
@@ -211,20 +175,34 @@ def finalize_spans(
     dtype: str = "list",
     gate_open: bool = True,
     suppress: bool = True,
+    overlap_policy: Optional[str] = None,
 ) -> List[RawSpan]:
     """Decode thresholded entity spans using the production contract."""
     if not gate_open:
         return []
-    spans = sorted(raw_spans, key=lambda span: (-span[1], span[2], span[3]))
-    if suppress:
-        kept: List[RawSpan] = []
-        for span in spans:
-            _, _, start, end = span
-            if any(
-                not (end <= kept_start or start >= kept_end)
-                for _, _, kept_start, kept_end in kept
-            ):
-                continue
-            kept.append(span)
-        spans = kept
+    if overlap_policy is None:
+        # Preserve the span architecture's published confidence-first greedy
+        # default. Explicit policies use the shared deterministic resolver.
+        ranked = sorted(raw_spans, key=lambda span: span[1], reverse=True)
+        if suppress:
+            spans = []
+            for candidate in ranked:
+                candidate_start, candidate_end = candidate[2], candidate[3]
+                if any(
+                    candidate_start < existing[3]
+                    and existing[2] < candidate_end
+                    for existing in spans
+                ):
+                    continue
+                spans.append(candidate)
+        else:
+            spans = ranked
+    else:
+        spans = resolve_overlaps(
+            raw_spans,
+            overlap_policy,
+            score=lambda span: span[1],
+            start=lambda span: span[2],
+            end=lambda span: span[3],
+        )
     return spans if dtype == "list" else spans[:1]

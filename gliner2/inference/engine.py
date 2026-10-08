@@ -23,9 +23,9 @@ from __future__ import annotations
 # Back-compat re-exports: existing code that does
 #   ``from gliner2.inference.engine import Schema, RegexValidator``
 # continues to work unchanged.
-from gliner2.inference.schema import (
+from gliner2.inference.schema import (  # noqa: F401 - compatibility exports
     AttributeGroup, RegexValidator, StructureBuilder, Schema
-)  # noqa: F401
+)
 
 from gliner2.auto import AutoExtractor
 from gliner2.inference.runtime import ExtractorRuntimeMixin
@@ -49,14 +49,12 @@ class GLiNER2(SpanExtractor):
 
 AutoExtractor.register("span", SpanExtractor, exist_ok=True)
 
-# Register the boundary architecture when its stack is importable. This keeps
-# ``AutoExtractor`` functional even before the boundary package is built.
-try:  # pragma: no cover - exercised once boundary package exists
-    from gliner2.models.boundary.engine import BoundaryExtractor  # noqa: F401
+# Boundary is a first-class architecture. Import failures must remain visible:
+# suppressing them here makes a broken installation look like an unsupported
+# checkpoint later, discarding the actionable root cause.
+from gliner2.models.boundary.engine import BoundaryExtractor  # noqa: E402
 
-    AutoExtractor.register("boundary", BoundaryExtractor, exist_ok=True)
-except Exception:  # noqa: BLE001
-    BoundaryExtractor = None  # type: ignore
+AutoExtractor.register("boundary", BoundaryExtractor, exist_ok=True)
 
 
 # Aliases

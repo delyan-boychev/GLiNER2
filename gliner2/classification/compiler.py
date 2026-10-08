@@ -1,12 +1,14 @@
 """Compile a ClassificationSchema into the model-schema dict + constraint set.
 
 This is where silent failure lives. ``_collate_batch`` swallows every exception
-and substitutes ``_create_fallback_record`` (``processor.py:369-374``), so a
-malformed compiled schema produces *garbage predictions, not an error*. This
+and substitutes ``SchemaTransformer._create_fallback_record`` (see
+``processor.py``), so a malformed compiled schema produces *garbage
+predictions, not an error*. This
 module's job is to make that impossible: it self-asserts the emitted shape
 before returning, and either the schema round-trips through the real processor
 with exact label alignment or it fails loudly at compile.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -14,19 +16,18 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from .constraints import (
-    AnyOtherSelected,
-    Constraint,
-    DictAssignment,
-    IsDefault,
-    Iff,
-    Not,
-)
+from .constraints import AnyOtherSelected, Constraint, DictAssignment, IsDefault, Iff, Not
 from .errors import SchemaError
 from .schema import ClassificationSchema, TaskSpec, _RESERVED
 
-_MODEL_KEYS = ("json_structures", "classifications", "entities", "relations",
-               "json_descriptions", "entity_descriptions")
+_MODEL_KEYS = (
+    "json_structures",
+    "classifications",
+    "entities",
+    "relations",
+    "json_descriptions",
+    "entity_descriptions",
+)
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,6 @@ def _classification_entry(spec: TaskSpec) -> dict:
     entry = {
         "task": spec.name,
         "labels": list(spec.label_names),
-        "true_label": ["N/A"],                    # MANDATORY: read unconditionally
         "multi_label": not spec.is_exclusive,
         "cls_threshold": spec.threshold,
         "class_act": spec.activation,
@@ -98,13 +98,11 @@ def _assert_model_schema(model: dict) -> None:
         task = entry.get("task")
         if not isinstance(task, str) or not task:
             raise SchemaError("classification entry has an invalid 'task'")
-        for required in ("labels", "true_label", "multi_label", "cls_threshold", "class_act"):
+        for required in ("labels", "multi_label", "cls_threshold", "class_act"):
             if required not in entry:
                 raise SchemaError(f"classification task {task!r} is missing {required!r}")
         if not isinstance(entry["labels"], list) or not entry["labels"]:
             raise SchemaError(f"classification task {task!r} has invalid 'labels'")
-        if entry["true_label"] != ["N/A"]:
-            raise SchemaError(f"classification task {task!r} must emit true_label ['N/A']")
         if not isinstance(entry["multi_label"], bool):
             raise SchemaError(f"classification task {task!r} has non-bool 'multi_label'")
 
@@ -151,9 +149,7 @@ def _static_feasibility(schema: ClassificationSchema, task_specs) -> None:
     undetermined = DictAssignment(schema, selected={}, decided=())
     for c in constraints:
         if c.evaluate(undetermined) is False:
-            raise SchemaError(
-                "constraint set is unsatisfiable on the declared label sets"
-            )
+            raise SchemaError("constraint set is unsatisfiable on the declared label sets")
 
     for spec in task_specs:
         if not spec.is_exclusive:
@@ -179,9 +175,7 @@ def _lower_defaults(schema: ClassificationSchema, task_specs) -> tuple:
     constraints = list(schema.constraints)
     for spec in task_specs:
         if spec.default is not None:
-            constraints.append(
-                Iff(IsDefault(spec.name), Not(AnyOtherSelected(spec.name)))
-            )
+            constraints.append(Iff(IsDefault(spec.name), Not(AnyOtherSelected(spec.name))))
     return tuple(constraints)
 
 

@@ -5,9 +5,12 @@ This test demonstrates the new API features for entity extraction.
 """
 
 import json
+import pytest
 from gliner2 import GLiNER2
 
 
+@pytest.mark.slow
+@pytest.mark.quality
 def test_entity_extraction():
     """Test entity extraction with various output formats."""
     
@@ -31,24 +34,28 @@ def test_entity_extraction():
     print("-" * 40)
     result = model.extract_entities(text, entity_types)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("entities"), dict)
     
     # Test 2: With confidence scores
     print("\n2. WITH CONFIDENCE SCORES")
     print("-" * 40)
     result = model.extract_entities(text, entity_types, include_confidence=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("entities"), dict)
     
     # Test 3: With span positions
     print("\n3. WITH SPAN POSITIONS")
     print("-" * 40)
     result = model.extract_entities(text, entity_types, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("entities"), dict)
     
     # Test 4: With both confidence and spans
     print("\n4. WITH CONFIDENCE AND SPAN POSITIONS")
     print("-" * 40)
     result = model.extract_entities(text, entity_types, include_confidence=True, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("entities"), dict)
     
     # Test 5: Verify character positions
     print("\n5. VERIFY CHARACTER POSITIONS")
@@ -59,12 +66,15 @@ def test_entity_extraction():
             print(f"{entity_type}: '{entity['text']}' at [{entity['start']}:{entity['end']}]")
             print(f"  Verification: text[{entity['start']}:{entity['end']}] = '{extracted_text}'")
             print(f"  Match: {extracted_text == entity['text']}")
+            assert extracted_text == entity["text"]
     
     print("\n" + "=" * 80)
     print("Entity extraction tests completed!")
     print("=" * 80)
 
 
+@pytest.mark.slow
+@pytest.mark.quality
 def test_batch_entity_extraction():
     """Test batch entity extraction with various output formats."""
     
@@ -93,6 +103,8 @@ def test_batch_entity_extraction():
         texts, entity_types, batch_size=2, 
         include_confidence=True, include_spans=True
     )
+    assert len(results) == len(texts)
+    assert all(isinstance(result.get("entities"), dict) for result in results)
     
     for i, (text, result) in enumerate(zip(texts, results)):
         print(f"\nText {i+1}: {text}")

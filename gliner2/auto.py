@@ -7,13 +7,17 @@ returns the matching public model class. Legacy checkpoints without an
 
 from __future__ import annotations
 
-import os
 from typing import Any, ClassVar, Dict, Optional, Type
 
 from gliner2.configuration import (
     ExtractorConfig,
     architecture_from_config,
     normalize_architecture,
+)
+from gliner2.models.loading import (
+    HUB_LOAD_OPTIONS,
+    checkpoint_file,
+    split_load_kwargs,
 )
 
 
@@ -29,16 +33,8 @@ class ArchitectureRegistrationError(ValueError):
     pass
 
 
-# Keys that address the Hub loader rather than the model constructor.
-_HUB_LOAD_KEYS = {
-    "cache_dir",
-    "force_download",
-    "local_files_only",
-    "token",
-    "revision",
-    "subfolder",
-    "proxies",
-}
+# Backward-compatible private alias; the shared loader owns the option set.
+_HUB_LOAD_KEYS = HUB_LOAD_OPTIONS
 
 
 def _ensure_registered() -> None:
@@ -101,7 +97,9 @@ class AutoExtractor:
         allow_architecture_override: bool = False,
         **kwargs: Any,
     ):
-        hub_kwargs = {k: kwargs[k] for k in _HUB_LOAD_KEYS if k in kwargs}
+        model_kwargs, hub_kwargs = split_load_kwargs(
+            kwargs, context="AutoExtractor.from_pretrained"
+        )
 
         if config is None:
             config = _load_config(pretrained_model_name_or_path, hub_kwargs)
@@ -117,8 +115,10 @@ class AutoExtractor:
             raise ArchitectureMismatchError(
                 f"Checkpoint architecture is {saved_architecture!r}, "
                 f"but {requested_architecture!r} was requested. "
-                "Use BoundaryExtractor.from_span_checkpoint() to transfer "
-                "a span checkpoint into a boundary model."
+                "Span and boundary heads are not checkpoint-compatible, and "
+                "automatic architecture conversion is not supported. Load the "
+                "checkpoint with its saved architecture or initialize and train "
+                "a separate boundary checkpoint."
             )
 
         model_class = cls._resolve_class(requested_architecture)
@@ -126,13 +126,11 @@ class AutoExtractor:
             pretrained_model_name_or_path,
             *model_args,
             config=config,
-            **kwargs,
+            **model_kwargs,
         )
 
 
 def _load_config(path, hub_kwargs: Dict[str, Any]) -> ExtractorConfig:
     """Load an ``ExtractorConfig`` from a local dir or the Hub."""
-    if os.path.isdir(str(path)):
-        config_file = os.path.join(str(path), "config.json")
-        return ExtractorConfig.from_pretrained(config_file)
-    return ExtractorConfig.from_pretrained(str(path), **hub_kwargs)
+    config_file = checkpoint_file(str(path), "config.json", hub_kwargs)
+    return ExtractorConfig.from_pretrained(config_file)

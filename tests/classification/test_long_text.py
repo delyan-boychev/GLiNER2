@@ -14,6 +14,7 @@ from gliner2.classification.long_text import aggregate_scores
 from gliner2.classification.schema import ClassificationSchema
 from gliner2.classification.compiler import compile_schema
 from gliner2.classification.scoring import ClassificationScores
+from gliner2.models.base import BaseExtractorModel
 
 
 # A fake whose per-label logits depend on the chunk text, so different chunks
@@ -33,7 +34,7 @@ class _TextKeyedProcessor:
                 return key
         return next(iter(self.logits_by_key))
 
-    def collate_fn_inference(self, rows, max_len=None):
+    def collate_fn_inference(self, rows, max_len=None, architecture="span"):
         texts = [t for t, _ in rows]
         batch = SimpleNamespace()
         batch.input_ids = torch.ones((len(texts), 4), dtype=torch.long)
@@ -72,6 +73,8 @@ class _FakeEncoder(torch.nn.Module):
 
 
 class _FakeModel(torch.nn.Module):
+    encode_tokens = BaseExtractorModel.encode_tokens
+
     def __init__(self, tasks, logits_by_key):
         super().__init__()
         self.encoder = _FakeEncoder()
@@ -147,3 +150,34 @@ def test_chunking_produces_multiple_chunks():
     text = "word " * 1000
     chunks = split_text_into_chunks(text, chunk_size=384, chunk_overlap=0)
     assert len(chunks) > 1  # documents chunk_size behavior for the long path
+
+
+def test_classify_long_uses_model_word_splitter(monkeypatch):
+    from gliner2.inference.chunking import TextChunk
+
+    sentinel = object()
+    captured = {}
+
+    def fake_split(text, chunk_size=384, chunk_overlap=64, word_splitter=None):
+        captured["word_splitter"] = word_splitter
+        return [
+            TextChunk(
+                text=text,
+                start_char=0,
+                end_char=len(text),
+                start_word=0,
+                end_word=1,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "gliner2.classification.long_text.split_text_into_chunks", fake_split
+    )
+    tasks = [("s", ["x", "y"])]
+    logits = {"": {"s": {"x": 2.0, "y": -1.0}}}
+    model = _FakeModel(tasks, logits)
+    model.processor.word_splitter = sentinel
+    clf = Classifier(model)
+    schema = ClassificationSchema().single("s", ["x", "y"])
+    clf.classify_long("hello world", schema)
+    assert captured["word_splitter"] is sentinel

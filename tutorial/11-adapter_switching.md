@@ -5,10 +5,10 @@
 Switch between domain-specific adapters during inference without reloading the base model.
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
 # Load base model once
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Load legal adapter
 model.load_adapter("./legal_adapter")
@@ -28,7 +28,7 @@ base_result = model.extract_entities("Some text", ["entity"])
 ### Loading an Adapter
 
 ```python
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 model.load_adapter("./path/to/adapter")
 ```
 
@@ -60,7 +60,7 @@ model.unload_adapter()
 Adapters automatically swap when you call `load_adapter()`:
 
 ```python
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Legal domain
 model.load_adapter("./legal_adapter")
@@ -102,7 +102,7 @@ def extract_with_routing(model, text, doc_type, adapters):
     )
 
 # Setup
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 adapters = {
     "legal": "./legal_adapter",
     "medical": "./medical_adapter",
@@ -160,7 +160,7 @@ class AdapterRouter:
     """Simple adapter router for multi-domain inference."""
     
     def __init__(self, base_model_name, adapters):
-        self.model = GLiNER2.from_pretrained(base_model_name)
+        self.model = AutoExtractor.from_pretrained(base_model_name)
         self.adapters = adapters
         self.current_domain = None
     

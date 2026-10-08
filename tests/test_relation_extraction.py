@@ -5,7 +5,11 @@ This test demonstrates the new API features for relation extraction.
 """
 
 import json
+import pytest
 from gliner2 import GLiNER2
+
+
+pytestmark = [pytest.mark.slow, pytest.mark.quality]
 
 
 def test_relation_extraction():
@@ -31,24 +35,28 @@ def test_relation_extraction():
     print("-" * 40)
     result = model.extract_relations(text, relation_types)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("relation_extraction"), dict)
     
     # Test 2: With confidence scores
     print("\n2. WITH CONFIDENCE SCORES")
     print("-" * 40)
     result = model.extract_relations(text, relation_types, include_confidence=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("relation_extraction"), dict)
     
     # Test 3: With span positions
     print("\n3. WITH SPAN POSITIONS")
     print("-" * 40)
     result = model.extract_relations(text, relation_types, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("relation_extraction"), dict)
     
     # Test 4: With both confidence and spans
     print("\n4. WITH CONFIDENCE AND SPAN POSITIONS")
     print("-" * 40)
     result = model.extract_relations(text, relation_types, include_confidence=True, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("relation_extraction"), dict)
     
     # Test 5: Verify character positions
     print("\n5. VERIFY CHARACTER POSITIONS")
@@ -62,6 +70,8 @@ def test_relation_extraction():
             print(f"    Verification: '{head_text}' - Match: {head_text == rel['head']['text']}")
             print(f"  Tail: '{rel['tail']['text']}' at [{rel['tail']['start']}:{rel['tail']['end']}]")
             print(f"    Verification: '{tail_text}' - Match: {tail_text == rel['tail']['text']}")
+            assert head_text == rel["head"]["text"]
+            assert tail_text == rel["tail"]["text"]
     
     print("\n" + "=" * 80)
     print("Relation extraction tests completed!")
@@ -95,6 +105,11 @@ def test_batch_relation_extraction():
     results = model.batch_extract_relations(
         texts, relation_types, batch_size=2,
         include_confidence=True, include_spans=True
+    )
+    assert len(results) == len(texts)
+    assert all(
+        isinstance(result.get("relation_extraction"), dict)
+        for result in results
     )
     
     for i, (text, result) in enumerate(zip(texts, results)):

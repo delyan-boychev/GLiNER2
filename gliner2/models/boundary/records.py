@@ -33,6 +33,10 @@ import torch.nn.functional as F
 
 from gliner2.models.candidates import CandidateSet
 from gliner2.models.boundary.constants import MASK_LOGIT
+from gliner2.models.boundary.validation import (
+    filter_match_indices,
+    safe_query_ids,
+)
 from gliner2.processing.records import FieldCardinality, RecordFieldSpec, RecordSpec
 from gliner2.processing.targets import RecordTarget, TargetCapacityError
 from gliner2.training.matching import (
@@ -330,18 +334,25 @@ class RecordHead(nn.Module):
         candidate_count = candidates.indices.shape[2]
         instance_count = max(candidate_count, self.instance_queries)
         hidden = query_states.shape[-1]
+        if query_states.shape[1] == 0 or candidates.valid_mask.shape[1] == 0:
+            raise ValueError("record routing requires at least one boundary query")
         batch_index = torch.arange(b, device=device)[:, None, None]
-        safe_query_ids = field_query_ids.clamp(
-            min=0, max=max(query_states.shape[1] - 1, 0)
+        safe_field_query_ids, valid_field_query_ids = safe_query_ids(
+            field_query_ids,
+            query_states.shape[1],
+            candidates.valid_mask.shape[1],
+            candidates.query_mask.shape[1],
+            candidates.pair_logits.shape[1],
         )
-        field_queries = query_states[batch_index, safe_query_ids]
+        effective_field_mask = field_mask & valid_field_query_ids
+        field_queries = query_states[batch_index, safe_field_query_ids]
         pool_states = candidates.candidate_states[:, 0]
         pool_spans = candidates.indices[:, 0]
         pool_mask = candidates.valid_mask[:, 0]
         membership = (
-            candidates.valid_mask[batch_index, safe_query_ids]
-            & candidates.query_mask[batch_index, safe_query_ids].unsqueeze(-1)
-            & field_mask.unsqueeze(-1)
+            candidates.valid_mask[batch_index, safe_field_query_ids]
+            & candidates.query_mask[batch_index, safe_field_query_ids].unsqueeze(-1)
+            & effective_field_mask.unsqueeze(-1)
             & pool_mask[:, None, None, :]
         )
 
@@ -374,7 +385,7 @@ class RecordHead(nn.Module):
             pool_instances,
         )
 
-        anchor_index = anchor_fields.clamp(min=0)
+        anchor_index = anchor_fields.clamp(min=0, max=membership.shape[2] - 1)
         anchor_membership = membership.gather(
             2,
             anchor_index[..., None, None].expand(
@@ -402,12 +413,14 @@ class RecordHead(nn.Module):
         )
         instance_mask &= group_mask[..., None]
 
-        anchor_qid = field_query_ids.gather(
-            2, anchor_index.unsqueeze(-1)
+        safe_anchor = anchor_index.clamp(max=field_query_ids.shape[2] - 1)
+        anchor_qid = safe_field_query_ids.gather(
+            2, safe_anchor.unsqueeze(-1)
         ).squeeze(-1).clamp(min=0)
+        safe_qid = anchor_qid.clamp(0, candidates.pair_logits.shape[1] - 1)
         natural_object = candidates.pair_logits[
             torch.arange(b, device=device)[:, None],
-            anchor_qid,
+            safe_qid,
         ]
         natural_object = F.pad(
             natural_object, (0, instance_count - candidate_count)
@@ -474,23 +487,34 @@ class RecordHead(nn.Module):
             dtype=torch.long,
             device=query_states.device,
         )
+        if query_states.shape[0] == 0 or candidates.valid_mask.shape[1] == 0:
+            raise ValueError("record routing requires at least one boundary query")
+        safe_field_query_ids, valid_field_query_ids = safe_query_ids(
+            field_query_ids,
+            query_states.shape[0],
+            candidates.valid_mask.shape[1],
+            candidates.query_mask.shape[1],
+            candidates.pair_logits.shape[1],
+        )
         pool_states = candidates.candidate_states[sample_index, 0]  # [C,H]
         pool_spans = candidates.indices[sample_index, 0].to(torch.long)
         pool_mask = candidates.valid_mask[sample_index, 0]
         membership = (
-            candidates.valid_mask[sample_index, field_query_ids]
-            & candidates.query_mask[sample_index, field_query_ids].unsqueeze(-1)
+            candidates.valid_mask[sample_index, safe_field_query_ids]
+            & candidates.query_mask[sample_index, safe_field_query_ids].unsqueeze(-1)
+            & valid_field_query_ids.unsqueeze(-1)
             & pool_mask.unsqueeze(0)
         )
-        field_queries = query_states[field_query_ids]
+        field_queries = query_states[safe_field_query_ids]
 
         if spec.mode == "natural":
             anchor_matches = field_query_ids == spec.anchor_query_id
             anchor_index = anchor_matches.to(torch.long).argmax()
             instance_states = pool_states
-            instance_mask = membership[anchor_index]
+            anchor_valid = anchor_matches.any() & valid_field_query_ids[anchor_index]
+            instance_mask = membership[anchor_index] & anchor_valid
             object_logits = candidates.pair_logits[
-                sample_index, field_query_ids[anchor_index]
+                sample_index, safe_field_query_ids[anchor_index]
             ]
             instance_pool_index = torch.arange(
                 pool_states.shape[0], device=pool_states.device
@@ -556,6 +580,21 @@ class RecordHead(nn.Module):
         device = query_states.device
         field_specs = list(spec.fields)
         field_query_ids = [f.query_id for f in field_specs]
+        query_count = min(
+            query_states.shape[0],
+            candidates.valid_mask.shape[1],
+            candidates.pair_logits.shape[1],
+            candidates.candidate_states.shape[1],
+        )
+        if query_count <= 0:
+            raise ValueError("record routing requires at least one boundary query")
+        valid_query_ids = [
+            0 <= query_id < query_count for query_id in field_query_ids
+        ]
+        safe_field_query_ids = [
+            min(max(query_id, 0), query_count - 1)
+            for query_id in field_query_ids
+        ]
 
         # Gather per-field candidate tensors (state / span / mask / logit).
         field_cand_states: List[torch.Tensor] = []
@@ -563,9 +602,8 @@ class RecordHead(nn.Module):
         field_cand_mask: List[torch.BoolTensor] = []
         field_cand_logits: List[torch.Tensor] = []
         cand_states_all = candidates.candidate_states
-        for f in field_specs:
-            qid = f.query_id
-            mask = candidates.valid_mask[sample_index, qid]        # [C]
+        for qid, query_valid in zip(safe_field_query_ids, valid_query_ids):
+            mask = candidates.valid_mask[sample_index, qid] & query_valid  # [C]
             keep = torch.nonzero(mask, as_tuple=False).flatten()
             spans = candidates.indices[sample_index, qid][keep]    # [Cf, 2]
             logits = candidates.pair_logits[sample_index, qid][keep]  # [Cf]
@@ -575,7 +613,7 @@ class RecordHead(nn.Module):
             field_cand_mask.append(torch.ones(keep.shape[0], dtype=torch.bool, device=device))
             field_cand_logits.append(logits)
 
-        fq = query_states[field_query_ids]                         # [F, H]
+        fq = query_states[safe_field_query_ids]                    # [F, H]
 
         instance_seed: List[Optional[Tuple[int, int]]] = []
         instance_spans: List[Optional[Tuple[int, int]]] = []
@@ -661,6 +699,7 @@ class DecodedRecord:
     """One decoded record: field query id -> selected half-open token spans."""
 
     fields: Dict[int, List[Tuple[int, int]]] = field(default_factory=dict)
+    field_scores: Dict[int, List[float]] = field(default_factory=dict)
     anchor_span: Optional[Tuple[int, int]] = None
     score: float = 0.0
 
@@ -689,12 +728,76 @@ def decode_group(
     obj_prob = torch.sigmoid(group.object_logits.detach() / temperature)
     select_thr = object_threshold if group.spec.mode == "anchorless" else anchor_threshold
     order = sorted(range(ni), key=lambda i: (-float(obj_prob[i]), i))
+    selected_instances = [
+        inst for inst in order if float(obj_prob[inst]) >= select_thr
+    ]
 
-    used_exclusive: set = set()
-    records: List[DecodedRecord] = []
-    for inst in order:
-        if float(obj_prob[inst]) < select_thr:
+    # Exclusive fields are a global assignment problem: greedily letting the
+    # highest-object instance claim its favorite candidate can force later
+    # instances onto unrelated spans. Solve scalar fields jointly and allocate
+    # each list candidate to its strongest instance.
+    scalar_choices: Dict[Tuple[int, int], Optional[Tuple[int, float]]] = {}
+    list_owners: Dict[Tuple[int, int], Tuple[int, float]] = {}
+    for f_idx, fspec in enumerate(group.field_specs):
+        if not fspec.exclusive or not selected_instances:
             continue
+        logits = torch.stack([
+            group.assign_logits[f_idx][inst].detach() / temperature
+            for inst in selected_instances
+        ])
+        candidate_count = max(int(logits.shape[-1]) - 1, 0)
+        if fspec.cardinality.is_scalar:
+            if candidate_count == 0:
+                for inst in selected_instances:
+                    scalar_choices[(inst, f_idx)] = None
+                continue
+            probs = torch.softmax(logits, dim=-1)
+            candidate_probs = probs[:, 1:]
+            eps = torch.finfo(candidate_probs.dtype).eps
+            candidate_cost = -torch.log(candidate_probs.clamp_min(eps))
+            row_count = len(selected_instances)
+            diagonal = -torch.log(probs[:, 0].clamp_min(eps))
+            if not fspec.allows_absent:
+                # Keep a finite emergency ABSENT column for under-capacity
+                # schemas, but never prefer it while a candidate is available.
+                diagonal = candidate_cost.max().detach() + 50.0
+                diagonal = diagonal.expand(row_count)
+            invalid_cost = max(
+                float(candidate_cost.max()),
+                float(diagonal.max()),
+            ) + 1_000.0
+            absent_cost = candidate_cost.new_full(
+                (row_count, row_count),
+                invalid_cost,
+            )
+            absent_cost[torch.arange(row_count), torch.arange(row_count)] = diagonal
+            cost = torch.cat((candidate_cost, absent_cost), dim=-1)
+            rows, cols = linear_sum_assignment(cost)
+            assignments = {int(row): int(col) for row, col in zip(rows, cols)}
+            for row, inst in enumerate(selected_instances):
+                col = assignments.get(row, candidate_count + row)
+                if col >= candidate_count:
+                    scalar_choices[(inst, f_idx)] = None
+                    continue
+                probability = float(candidate_probs[row, col])
+                if probability < field_threshold and fspec.allows_absent:
+                    scalar_choices[(inst, f_idx)] = None
+                    continue
+                scalar_choices[(inst, f_idx)] = (col, probability)
+        else:
+            if candidate_count == 0:
+                continue
+            probabilities = torch.sigmoid(logits[:, 1:])
+            for cand_idx in range(candidate_count):
+                probability, row = probabilities[:, cand_idx].max(dim=0)
+                if float(probability) >= field_threshold:
+                    list_owners[(f_idx, cand_idx)] = (
+                        selected_instances[int(row)],
+                        float(probability),
+                    )
+
+    records: List[DecodedRecord] = []
+    for inst in selected_instances:
         rec = DecodedRecord(score=float(obj_prob[inst]))
         anchor_field_idx = None
         if group.spec.mode == "natural":
@@ -710,17 +813,29 @@ def decode_group(
             if anchor_field_idx is not None and f_idx == anchor_field_idx:
                 if rec.anchor_span is not None:
                     rec.fields.setdefault(qid, []).append(rec.anchor_span)
+                    rec.field_scores.setdefault(qid, []).append(rec.score)
                 continue
 
             if fspec.cardinality.is_scalar:
+                if fspec.exclusive:
+                    choice = scalar_choices.get((inst, f_idx))
+                    if choice is None:
+                        continue
+                    cand_idx, probability = choice
+                    span = (
+                        int(spans_tensor[cand_idx, 0]),
+                        int(spans_tensor[cand_idx, 1]),
+                    )
+                    rec.fields.setdefault(qid, []).append(span)
+                    rec.field_scores.setdefault(qid, []).append(probability)
+                    continue
                 probs = torch.softmax(logits_row, dim=-1)
                 chosen = None
                 for col in torch.argsort(probs, descending=True).tolist():
                     if col == 0:
-                        chosen = 0
-                        break
-                    cand_idx = col - 1
-                    if fspec.exclusive and (f_idx, cand_idx) in used_exclusive:
+                        if fspec.allows_absent:
+                            chosen = 0
+                            break
                         continue
                     chosen = col
                     break
@@ -731,25 +846,30 @@ def decode_group(
                 cand_idx = chosen - 1
                 span = (int(spans_tensor[cand_idx, 0]), int(spans_tensor[cand_idx, 1]))
                 rec.fields.setdefault(qid, []).append(span)
-                if fspec.exclusive:
-                    used_exclusive.add((f_idx, cand_idx))
+                rec.field_scores.setdefault(qid, []).append(float(probs[chosen]))
             else:
                 cand_logits = logits_row[1:]
                 if cand_logits.numel() == 0:
                     continue
                 probs = torch.sigmoid(cand_logits)
                 selected: List[Tuple[int, int]] = []
+                selected_scores: List[float] = []
                 for cand_idx in range(cand_logits.shape[0]):
-                    if float(probs[cand_idx]) < field_threshold:
-                        continue
-                    if fspec.exclusive and (f_idx, cand_idx) in used_exclusive:
-                        continue
+                    if fspec.exclusive:
+                        owner = list_owners.get((f_idx, cand_idx))
+                        if owner is None or owner[0] != inst:
+                            continue
+                        probability = owner[1]
+                    else:
+                        probability = float(probs[cand_idx])
+                        if probability < field_threshold:
+                            continue
                     span = (int(spans_tensor[cand_idx, 0]), int(spans_tensor[cand_idx, 1]))
                     selected.append(span)
-                    if fspec.exclusive:
-                        used_exclusive.add((f_idx, cand_idx))
+                    selected_scores.append(probability)
                 if selected:
                     rec.fields.setdefault(qid, []).extend(selected)
+                    rec.field_scores.setdefault(qid, []).extend(selected_scores)
         if rec.fields:
             records.append(rec)
 
@@ -760,6 +880,13 @@ def decode_group(
             if key not in best or rec.score > best[key].score:
                 best[key] = rec
         records = list(best.values())
+    elif group.spec.mode == "natural":
+        records.sort(
+            key=lambda record: (
+                record.anchor_span is None,
+                record.anchor_span or (0, 0),
+            )
+        )
     return records
 
 
@@ -785,7 +912,10 @@ def _resolve_value_cols(value_alternatives, span_to_idx):
 
 def _scalar_field_nll(logits_row: torch.Tensor, target_cols) -> torch.Tensor:
     logp = F.log_softmax(logits_row, dim=-1)
-    idx = torch.tensor(target_cols or [0], dtype=torch.long, device=logits_row.device)
+    cols = target_cols or [0]
+    max_idx = logits_row.shape[-1] - 1
+    cols = [min(c, max_idx) for c in cols if 0 <= c <= max_idx] or [0]
+    idx = torch.tensor(cols, dtype=torch.long, device=logits_row.device)
     return -torch.logsumexp(logp[idx], dim=-1)
 
 
@@ -794,8 +924,11 @@ def _list_field_bce(logits_row: torch.Tensor, positive_cols) -> torch.Tensor:
     if cand_logits.numel() == 0:
         return logits_row.new_zeros(())
     target = torch.zeros_like(cand_logits)
+    n = cand_logits.shape[0]
     for col in positive_cols:
-        target[col - 1] = 1.0
+        idx = col - 1
+        if 0 <= idx < n:
+            target[idx] = 1.0
     return F.binary_cross_entropy_with_logits(cand_logits, target, reduction="mean")
 
 
@@ -839,9 +972,12 @@ def _instance_field_logprob(group, inst: int, record: RecordTarget, span_indices
             cand_logits = row[1:]
             if cand_logits.numel() == 0:
                 continue
+            n = cand_logits.shape[0]
             target = torch.zeros_like(cand_logits)
             for col in cols:
-                target[col - 1] = 1.0
+                idx = col - 1
+                if 0 <= idx < n:
+                    target[idx] = 1.0
             total = total - F.binary_cross_entropy_with_logits(cand_logits, target, reduction="sum")
     return total
 
@@ -968,6 +1104,13 @@ def compute_dense_group_loss(
         if gold_indicator is None
         else gold_indicator.to(device=device, dtype=torch.bool)
     )
+    n_cands_logits = group.assign_logits.shape[-1] - 1
+    n_cands_gold = gold.shape[-1]
+    if n_cands_gold > n_cands_logits:
+        gold = gold[..., :n_cands_logits]
+    elif n_cands_gold < n_cands_logits:
+        pad = gold.new_zeros(*gold.shape[:-1], n_cands_logits - n_cands_gold)
+        gold = torch.cat([gold, pad], dim=-1)
     scalar = torch.as_tensor(
         [field.cardinality.is_scalar for field in group.field_specs],
         dtype=torch.bool, device=device,
@@ -1002,16 +1145,30 @@ def compute_dense_group_loss(
         matched_rows = rows.to(device)
         matched_cols = cols.to(device)
         object_target = torch.zeros_like(group.object_logits)
-        object_target.scatter_(0, matched_rows, 1.0)
+        ni = group.object_logits.shape[0]
+        valid_rows = matched_rows[matched_rows < ni]
+        if valid_rows.numel() > 0:
+            object_target.scatter_(0, valid_rows, 1.0)
         object_terms = F.binary_cross_entropy_with_logits(
             group.object_logits, object_target, reduction="none"
         )
         object_loss = (
             object_terms * group.instance_mask.to(object_terms.dtype)
         ).sum() / group.instance_mask.sum().clamp_min(1)
+    valid_matches = (
+        (matched_rows >= 0)
+        & (matched_rows < field_nll.shape[0])
+        & (matched_cols >= 0)
+        & (matched_cols < field_nll.shape[1])
+    )
+    if valid_matches.any():
+        safe_rows = matched_rows.clamp(min=0, max=field_nll.shape[0] - 1)
+        valid_matches &= group.instance_mask[safe_rows]
+    valid_rows = matched_rows[valid_matches]
+    valid_cols = matched_cols[valid_matches]
     field_loss = (
-        field_nll[matched_rows, matched_cols].mean()
-        if matched_rows.numel()
+        field_nll[valid_rows, valid_cols].mean()
+        if valid_rows.numel()
         else zero
     )
     return {
@@ -1030,6 +1187,16 @@ def compute_dense_batch_loss(
     """Vectorized record loss; only Hungarian assignment remains per group."""
     device = output.object_logits.device
     record_mask = record_mask.to(device)
+    gold_indicator = gold_indicator.to(device)
+    n_cands_logits = output.assign_logits.shape[-1] - 1
+    n_cands_gold = gold_indicator.shape[-1]
+    if n_cands_gold > n_cands_logits:
+        gold_indicator = gold_indicator[..., :n_cands_logits]
+    elif n_cands_gold < n_cands_logits:
+        pad = gold_indicator.new_zeros(
+            *gold_indicator.shape[:-1], n_cands_logits - n_cands_gold
+        )
+        gold_indicator = torch.cat([gold_indicator, pad], dim=-1)
     present = gold_indicator.any(-1)
     target = torch.cat(((~present).unsqueeze(-1), gold_indicator), -1)
     logp = F.log_softmax(output.assign_logits, -1)
@@ -1087,7 +1254,7 @@ def compute_dense_batch_loss(
         ).cpu()
         natural_gold = gold_indicator.gather(
             3,
-            output.anchor_fields.clamp(min=0)[..., None, None, None].expand(
+            output.anchor_fields.clamp(min=0, max=gold_indicator.shape[3] - 1)[..., None, None, None].expand(
                 *gold_indicator.shape[:3], 1, gold_indicator.shape[-1]
             ),
         ).squeeze(3).cpu()
@@ -1136,13 +1303,24 @@ def compute_dense_batch_loss(
             matched_cols,
         )
     )
+    index = filter_match_indices(
+        index,
+        field_nll.shape,
+        instance_mask=output.instance_mask,
+    )
     object_target = torch.zeros_like(output.object_logits)
-    non_natural = output.modes[index[0], index[1]] != 0
-    object_target[
-        index[0][non_natural],
-        index[1][non_natural],
-        index[2][non_natural],
-    ] = 1.0
+    non_natural = (
+        output.modes[index[0], index[1]] != 0
+        if index[0].numel()
+        else torch.zeros(0, dtype=torch.bool, device=device)
+    )
+    row_idx = index[2][non_natural]
+    if row_idx.numel():
+        object_target[
+            index[0][non_natural],
+            index[1][non_natural],
+            row_idx,
+        ] = 1.0
     object_keep = (
         output.instance_mask
         & output.group_mask[..., None]
@@ -1218,17 +1396,26 @@ def compute_group_loss(group: RecordGroupOutput, records: Sequence[RecordTarget]
             for j, record in enumerate(records):
                 cost[i, j] = -(obj_logp[i] + _instance_field_logprob(group, i, record, span_indices))
     row_ind, col_ind = linear_sum_assignment(cost)
-    matched_rows = {int(row) for row in row_ind.tolist()}
+    matched_rows = {
+        int(row) for row in row_ind.tolist() if 0 <= int(row) < ni
+    }
     obj_target = torch.zeros(ni, device=device)
     for row in matched_rows:
         obj_target[row] = 1.0
     object_loss = F.binary_cross_entropy_with_logits(group.object_logits, obj_target)
     field_loss = zero
-    for row, col in zip(row_ind.tolist(), col_ind.tolist()):
-        field_loss = field_loss + _instance_field_loss(group, int(row), records[int(col)], span_indices)
+    valid_pairs = [
+        (int(row), int(col))
+        for row, col in zip(row_ind.tolist(), col_ind.tolist())
+        if 0 <= int(row) < ni and 0 <= int(col) < len(records)
+    ]
+    for row, col in valid_pairs:
+        field_loss = field_loss + _instance_field_loss(
+            group, row, records[col], span_indices
+        )
     return {
         "object_loss": object_loss,
-        "field_loss": field_loss / max(len(row_ind), 1),
+        "field_loss": field_loss / max(len(valid_pairs), 1),
         "object_count": ni,
-        "field_count": len(row_ind) * len(group.field_specs),
+        "field_count": len(valid_pairs) * len(group.field_specs),
     }

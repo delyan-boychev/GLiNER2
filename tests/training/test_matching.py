@@ -54,6 +54,20 @@ def test_hungarian_empty():
     assert len(row) == 0 and len(col) == 0
 
 
+def test_hungarian_accepts_mps_costs():
+    if not torch.backends.mps.is_available():
+        return
+    cost = torch.tensor(
+        [[3.0, 1.0], [1.0, 3.0]],
+        device="mps",
+    )
+
+    row, col = linear_sum_assignment(cost)
+
+    assert row.tolist() == [0, 1]
+    assert col.tolist() == [1, 0]
+
+
 def test_record_matching_is_permutation_invariant():
     torch.manual_seed(2)
     inst_queries, fields, cands = 5, 2, 4

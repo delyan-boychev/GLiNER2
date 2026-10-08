@@ -366,6 +366,8 @@ def assemble_candidates(
 
     if gold_pairs is not None and gold_mask is not None:
         gvalid = gold_mask & query_mask.unsqueeze(-1)
+        oob = (gold_pairs[..., 0] >= n_boundaries) | (gold_pairs[..., 1] >= n_boundaries) | (gold_pairs < 0).any(-1)
+        gvalid = gvalid & ~oob
         if gold_injection_prob <= 0.0:
             gvalid = torch.zeros_like(gvalid)
         elif gold_injection_prob < 1.0:
@@ -373,7 +375,8 @@ def assemble_candidates(
                 gvalid.shape, device=gvalid.device, generator=generator
             )
             gvalid = gvalid & (sampled < gold_injection_prob)
-        gkeys = gold_pairs[..., 0] * n_boundaries + gold_pairs[..., 1]
+        safe_gold = gold_pairs.clamp(0, n_boundaries - 1)
+        gkeys = safe_gold[..., 0] * n_boundaries + safe_gold[..., 1]
         gkeys = torch.where(
             gvalid, gkeys, torch.full_like(gkeys, invalid_key)
         )
@@ -438,6 +441,61 @@ class SparseBoundaryProposer(nn.Module):
         self.rotary = (
             RotaryBoundaryEmbedding(boundary_dim, settings.rotary_base)
             if settings.enable_rotary_endpoints else None
+        )
+
+    def score_explicit_pairs(
+        self,
+        boundary_states: torch.Tensor,
+        query_states: torch.Tensor,
+        indices: torch.LongTensor,
+        valid_mask: torch.BoolTensor,
+    ) -> torch.Tensor:
+        """Return the marginal-free proposal prior for explicit span pairs.
+
+        This is the differentiable compatibility term used for candidates
+        selected by :meth:`forward`, evaluated at caller-provided half-open
+        ``[start, end)`` coordinates.  It lets downstream decoders force-score
+        a retained span for another query without depending on that query's
+        sparse top-k proposal set.
+        """
+        if indices.dim() != 4 or indices.shape[-1] != 2:
+            raise ValueError(
+                f"indices must be [B, Q, C, 2], got {tuple(indices.shape)}"
+            )
+        if valid_mask.shape != indices.shape[:-1]:
+            raise ValueError(
+                "valid_mask must match indices [B, Q, C], got "
+                f"{tuple(valid_mask.shape)} and {tuple(indices.shape)}"
+            )
+        if (
+            indices.shape[0] != boundary_states.shape[0]
+            or indices.shape[0] != query_states.shape[0]
+            or indices.shape[1] != query_states.shape[1]
+        ):
+            raise ValueError("explicit pair batch/query dimensions do not match states")
+
+        start_all = self.start_pair_projection(boundary_states)
+        end_all = self.end_key_projection(boundary_states)
+        if self.rotary is not None:
+            positions = torch.arange(
+                boundary_states.shape[1], device=boundary_states.device
+            ).view(1, -1)
+            start_all = self.rotary(start_all, positions)
+            end_all = self.rotary(end_all, positions)
+        gate = torch.sigmoid(self.start_query_projection(query_states))
+        if self.rotary is not None:
+            gate = gate.repeat_interleave(2, dim=-1)
+
+        starts = indices[..., 0].clamp(0, boundary_states.shape[1] - 1)
+        ends = indices[..., 1].clamp(0, boundary_states.shape[1] - 1)
+        start_states = gather_states(start_all, starts) * gate.unsqueeze(2)
+        end_states = gather_states(end_all, ends)
+        compatibility = (
+            (start_states * end_states).sum(-1)
+            / math.sqrt(self.boundary_dim)
+        )
+        return torch.where(
+            valid_mask, compatibility, torch.zeros_like(compatibility)
         )
 
     def forward(
@@ -538,7 +596,7 @@ class SparseBoundaryProposer(nn.Module):
             st_valid.unsqueeze(-1)
             & query_mask.view(b, q, 1, 1)
             & boundary_mask.gather(
-                1, fwd_end_idx.reshape(b, -1)
+                1, fwd_end_idx.reshape(b, -1).clamp(0, boundary_mask.shape[1] - 1)
             ).view_as(fwd_end_idx)
             & (fwd_end_idx > fwd_start)
         ).reshape(b, q, -1)
@@ -571,7 +629,7 @@ class SparseBoundaryProposer(nn.Module):
                     en_valid.unsqueeze(-1)
                     & query_mask.view(b, q, 1, 1)
                     & boundary_mask.gather(
-                        1, bwd_start_idx.reshape(b, -1)
+                        1, bwd_start_idx.reshape(b, -1).clamp(0, boundary_mask.shape[1] - 1)
                     ).view_as(bwd_start_idx)
                     & (bwd_end > bwd_start_idx)
                 ).reshape(b, q, -1)
@@ -625,8 +683,8 @@ class SparseBoundaryProposer(nn.Module):
         compat = (g_s * g_e).sum(-1) * scale                            # [B,Q,C]
         out_logits = None
         if self.training or return_proposal_logits:
-            sm = torch.gather(start_logits, 2, si)
-            em = torch.gather(end_logits, 2, ej)
+            sm = torch.gather(start_logits, 2, si.clamp(0, start_logits.shape[2] - 1))
+            em = torch.gather(end_logits, 2, ej.clamp(0, end_logits.shape[2] - 1))
             logits_diff = compat + sm + em
             neg_inf_like = torch.full_like(logits_diff, MASK_LOGIT)
             out_logits = torch.where(out_valid, logits_diff, neg_inf_like)

@@ -2,6 +2,8 @@
 
 Complete guide to training GLiNER2 models for entity extraction, classification, structured data extraction, and relation extraction.
 
+Load checkpoints with `AutoExtractor.from_pretrained(...)` — it works for both span and boundary bases. `ExtractorTrainer` is the trainer class (`GLiNER2Trainer` is a backward-compatible alias).
+
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
@@ -10,7 +12,8 @@ Complete guide to training GLiNER2 models for entity extraction, classification,
 4. [Training Configuration](#training-configuration)
 5. [LoRA Training](#lora-training)
 6. [Advanced Topics](#advanced-topics)
-7. [Troubleshooting](#troubleshooting)
+7. [Hosted Training (Fastino API)](#hosted-training-fastino-api)
+8. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -19,9 +22,9 @@ Complete guide to training GLiNER2 models for entity extraction, classification,
 ### Minimal Example
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # 1. Create training examples
 examples = [
@@ -36,7 +39,8 @@ examples = [
 ]
 
 # 2. Initialize model and config
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+# Span legacy: fastino/gliner2-base-v1 | Boundary: fastino/gliner2.5-base-v1
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./output",
     num_epochs=10,
@@ -46,7 +50,7 @@ config = TrainingConfig(
 )
 
 # 3. Train
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
@@ -56,13 +60,13 @@ trainer.train(train_data=examples)
 # Create train.jsonl file with format:
 # {"input": "text here", "output": {"entities": {"type": ["mention1", "mention2"]}}}
 
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(output_dir="./output", num_epochs=10)
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data="train.jsonl")
 ```
 
@@ -73,9 +77,9 @@ trainer.train(train_data="train.jsonl")
 ### Example 1: Complete NER Training Pipeline
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, TrainingDataset
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Step 1: Prepare training data
 train_examples = [
@@ -127,7 +131,7 @@ train_data.save("train.jsonl")
 val_data.save("val.jsonl")
 
 # Step 5: Configure training
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./ner_model",
     experiment_name="ner_training",
@@ -147,7 +151,7 @@ config = TrainingConfig(
 )
 
 # Step 6: Train
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 results = trainer.train(
     train_data=train_data,
     eval_data=val_data
@@ -159,15 +163,15 @@ print(f"Total steps: {results['total_steps']}")
 print(f"Training time: {results['total_time_seconds']/60:.1f} minutes")
 
 # Step 7: Load best model for inference
-best_model = GLiNER2.from_pretrained("./ner_model/best")
+best_model = AutoExtractor.from_pretrained("./ner_model/best")
 ```
 
 ### Example 2: Multi-Task Training (NER + Classification + Relations)
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, Classification, Relation
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Create multi-task examples
 examples = [
@@ -194,7 +198,7 @@ examples = [
 ]
 
 # Train multi-task model
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./multitask_model",
     num_epochs=20,
@@ -203,16 +207,16 @@ config = TrainingConfig(
     task_lr=5e-4
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
 ### Example 3: Domain-Specific Fine-tuning (Medical NER)
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 from gliner2.training.data import InputExample, TrainingDataset
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Medical domain examples
 medical_examples = [
@@ -244,7 +248,7 @@ medical_examples = [
 ]
 
 # Fine-tune on medical domain
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 config = TrainingConfig(
     output_dir="./medical_ner",
     num_epochs=20,
@@ -254,7 +258,7 @@ config = TrainingConfig(
     warmup_ratio=0.05
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=medical_examples)
 ```
 
@@ -387,6 +391,14 @@ example = InputExample(
 )
 ```
 
+When these structures are saved as JSONL and trained with the boundary
+architecture, they automatically use `natural` record formation. The first
+declared field is the anchor, so legacy data needs no `record_metadata` block.
+For example, `product` is the anchor in the `order` structure above. Field
+names such as `mode`, `anchor`, and `occurrence_policy` remain valid ordinary
+JSON structure fields; record-specific overrides belong in the separate
+`output.record_metadata` mapping.
+
 #### Relation Extraction
 
 ```python
@@ -436,6 +448,39 @@ print(f"Valid: {report['valid']}, Invalid: {report['invalid']}")
 # Print statistics
 dataset.print_stats()
 ```
+
+`TrainingDataset.validate()`/`InputExample.validate()` check that an entity
+value is an exact *character substring* of the text (case-insensitive).
+That is necessary but not sufficient for the boundary architecture: training
+also requires the value to align to a contiguous run of *tokens*, and the
+word splitter's hyphen/underscore continuation rule (`\w+(?:[-_]\w+)*`) means
+a value can be a real substring yet still fail token alignment -- e.g.
+`"ABS"` inside `"...LEDRemote-ABS-BES3-MY2023.png..."` is swallowed into one
+token by the surrounding hyphen-joined run. A mismatch like this passes
+`validate()` but raises inside `collate_fn_train`/`ExtractorCollator` with
+`architecture="boundary"`. Use
+`SchemaTransformer.find_unalignable_entities(text, entities)` on a single
+`(text, schema)` example to catch this ahead of submitting a full dataset:
+
+```python
+from gliner2 import AutoExtractor
+
+model = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
+processor = model.processor  # the SchemaTransformer backing this model
+
+unalignable = processor.find_unalignable_entities(
+    "See IMG Bosch-eBike-LEDRemote-ABS-BES3-MY2023.png for wiring.",
+    {"PartCode": "ABS"},
+)
+# [{'entity_type': 'PartCode', 'value': 'ABS', 'value_index': None}]
+if unalignable:
+    print(f"{len(unalignable)} listed value(s) will not token-align:", unalignable)
+```
+
+An empty list means every listed value aligns and will not raise during
+training. It reuses the exact tokenizer and sublist search
+`collate_fn_train` uses to build gold targets, so it can never drift from
+actual training behavior.
 
 ### Data Splitting and Management
 
@@ -704,11 +749,11 @@ GLiNER2 supports both coarse-grained (module groups) and fine-grained (specific 
 ### Basic LoRA Training
 
 ```python
-from gliner2 import GLiNER2
-from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
+from gliner2 import AutoExtractor
+from gliner2.training.trainer import ExtractorTrainer, TrainingConfig
 
 # Load base model
-model = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+model = AutoExtractor.from_pretrained("fastino/gliner2-base-v1")
 
 # Configure LoRA training
 config = TrainingConfig(
@@ -735,11 +780,11 @@ config = TrainingConfig(
 )
 
 # Train with LoRA
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 results = trainer.train(train_data="train.jsonl", eval_data="val.jsonl")
 
 # Checkpoints contain merged weights (ready for inference)
-best_model = GLiNER2.from_pretrained("./output_lora/best")
+best_model = AutoExtractor.from_pretrained("./output_lora/best")
 ```
 
 ### LoRA Configuration Parameters
@@ -816,7 +861,7 @@ config = TrainingConfig(
     fp16=True
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data="train.jsonl")
 ```
 
@@ -836,7 +881,7 @@ config = TrainingConfig(
     num_epochs=15
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data="train.jsonl")
 ```
 
@@ -856,7 +901,7 @@ config = TrainingConfig(
     warmup_ratio=0.05
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=medical_examples)
 ```
 
@@ -884,7 +929,7 @@ trainer.train(train_data=medical_examples)
 
 ```python
 # Load model from checkpoint (for inference or continued training)
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 
 # Load checkpoint (weights are merged in checkpoint)
 trainer.load_checkpoint("./output_lora/checkpoint-1000")
@@ -915,7 +960,7 @@ def compute_metrics(model, eval_dataset):
     
     return metrics
 
-trainer = GLiNER2Trainer(
+trainer = ExtractorTrainer(
     model=model,
     config=config,
     compute_metrics=compute_metrics
@@ -927,7 +972,7 @@ trainer.train(train_data=examples, eval_data=eval_examples)
 ### Loading Checkpoints
 
 ```python
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 
 # Load checkpoint (model weights only, no optimizer state)
 trainer.load_checkpoint("./output/checkpoint-1000")
@@ -952,7 +997,7 @@ config = TrainingConfig(
     local_rank=int(os.environ.get("LOCAL_RANK", -1))  # Auto-detect DDP
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 ```
 
@@ -998,7 +1043,7 @@ config = TrainingConfig(
     wandb_notes="Testing new architecture"
 )
 
-trainer = GLiNER2Trainer(model, config)
+trainer = ExtractorTrainer(model, config)
 trainer.train(train_data=examples)
 # Metrics automatically logged to W&B
 ```
@@ -1031,6 +1076,29 @@ for ex in dataset:
 augmented_dataset = TrainingDataset(augmented_examples)
 trainer.train(train_data=augmented_dataset)
 ```
+
+---
+
+## Hosted Training (Fastino API)
+
+Everything above runs locally. If you'd rather not manage GPUs, the Fastino API can fine-tune, evaluate, and serve GLiNER models for you, which is usually faster than training locally.
+
+| | |
+|---|---|
+| Base URL | `https://api.fastino.ai` |
+| Auth | `X-API-Key: $FASTINO_API_KEY` (get a key at [agent.fastino.ai](https://agent.fastino.ai)) |
+| Request/response schemas | [`https://api.fastino.ai/openapi.json`](https://api.fastino.ai/openapi.json) |
+| Agent workflow | [`SKILL.md`](https://huggingface.co/fastino/gliner2.5-base-v1/blob/main/SKILL.md) (also shipped in each GLiNER model repo on Hugging Face) |
+
+The typical flow:
+
+1. **Pick a base model:** `GET /v1/base-models?supports_training=true`. Check `encoder_features` before relying on a capability.
+2. **Upload a dataset:** `POST /v1/datasets/upload/url` returns a presigned URL and a `dataset_id`. `PUT` your file to that URL, call `POST /v1/datasets/upload/process` with the `dataset_id`, then poll `GET /v1/datasets/{name}` until it is ready.
+3. **Train:** `POST /v1/training-jobs` with `model_name`, `base_model`, and `datasets`. Optional fields include `training_type` (`lora` or `full`), `nr_epochs`, and `encoder_learning_rate` / `task_learning_rate`.
+4. **Monitor:** `GET /v1/training-jobs/{job_id}`, plus `/logs` and `/checkpoints`.
+5. **Serve:** `POST /v1/training-jobs/{job_id}/checkpoints/{checkpoint_id}/deploy`, then call the model through `POST /v1/chat/completions` with a GLiNER `schema`.
+
+See the OpenAPI spec for exact field names and the accepted dataset formats.
 
 ---
 
@@ -1111,6 +1179,17 @@ example = InputExample(
     text="John works here",
     entities={"person": ["John"]}  # OK
 )
+
+# 1b. Entity IS in text but does not token-align (boundary architecture only)
+# example.validate() passes ("abs" is a substring), but this will still raise
+# from collate_fn_train/ExtractorCollator, because the tokenizer's hyphen
+# continuation rule swallows the whole hyphen-joined run into one token.
+processor.find_unalignable_entities(
+    "See IMG Bosch-eBike-LEDRemote-ABS-BES3-MY2023.png for wiring.",
+    {"PartCode": "ABS"},
+)
+# [{'entity_type': 'PartCode', 'value': 'ABS', 'value_index': None}]
+# Fix: re-annotate with a token-aligned surface, or drop the value.
 
 # 2. Empty entities
 example = InputExample(

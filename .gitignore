@@ -95,13 +95,19 @@ Thumbs.db
 *.onnx
 *.safetensors
 !/tests/models/boundary/_golden/*.safetensors
+!/tests/fixtures/compat/**
 
 # Logs
 *.log
+runs/
+**/runs/
+.smoke/
 
 test_api_client.py
-/docs/boundary_architecture.md
-/benchmarks/
+
+# Downloaded / converted training corpora
+/data/pile_ner/
+
 /scripts/*
 !/scripts/check_public_surface.py
 !/scripts/surface_snapshot.py

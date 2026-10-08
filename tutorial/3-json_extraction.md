@@ -2,6 +2,8 @@
 
 Learn how to extract complex structured data from text using GLiNER2's hierarchical extraction capabilities.
 
+On **GLiNER2.5 boundary** checkpoints, prefer record mode (`structure(..., mode="natural", anchor=...)`) when repeated instances must keep field identity. See [Boundary architecture](../docs/boundary_architecture.md#4-record-and-event-decoding).
+
 ## Table of Contents
 - [Quick API with extract_json](#quick-api-with-extract_json)
 - [Field Types and Specifications](#field-types-and-specifications)
@@ -17,10 +19,9 @@ For structure-only extraction, use the `extract_json()` method with the simple d
 ### Basic Structure Extraction
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
-# Load model
-extractor = GLiNER2.from_pretrained("your-model-name")
+extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Simple product extraction
 text = "The MacBook Pro costs $1999 and features M3 chip, 16GB RAM, and 512GB storage."

@@ -6,6 +6,7 @@ import inspect
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from gliner2.inference.chunking import split_text_into_chunks
+from gliner2.processing.word_splitter import word_splitter_from
 
 from .result import JointEntity, JointRelation, JointResult
 
@@ -21,7 +22,12 @@ def extract_long_text(engine: Any, text: str, schema: Any = None,
     """
     include_confidence = True if config is None else config.include_confidence
     include_spans = True if config is None else config.include_spans
-    chunks = split_text_into_chunks(text, chunk_size, chunk_overlap)
+    chunks = split_text_into_chunks(
+        text,
+        chunk_size,
+        chunk_overlap,
+        word_splitter=word_splitter_from(engine),
+    )
     fragments: List[Tuple[Any, JointResult]] = []
     for chunk in chunks:
         raw = _extract_chunk(engine, chunk.text, schema, config, kwargs)

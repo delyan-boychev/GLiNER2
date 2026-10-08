@@ -104,12 +104,13 @@ class MinViolationsDecoder:
                 dfs(i + 1, chosen, score + local.utility)
                 del chosen[task]
 
+        exhausted = False
         try:
             dfs(0, {}, 0.0)
         except _BudgetExceeded:
-            pass
+            exhausted = True  # best-so-far is not proven minimal
         assign = best["assign"] or {t: problem.locals[t][0] for t in problem.task_order}
         violated = problem.violations_of(assign)
         score = sum(la.utility for la in assign.values())
         return Solution(assignments=dict(assign), score=score,
-                        violations=violated, exact=True, decoder=self.name)
+                        violations=violated, exact=not exhausted, decoder=self.name)

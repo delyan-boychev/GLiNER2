@@ -15,6 +15,7 @@ from gliner2.inference.chunking import (
     remap_result_spans,
     split_text_into_chunks,
 )
+from gliner2.processing.word_splitter import CharLevelSplitter, WhitespaceTokenSplitter
 
 
 TEXTS = [
@@ -53,3 +54,34 @@ def test_chunk_text_starts_at_word_not_whitespace():
         # Chunks begin exactly at a word boundary, never on stripped whitespace.
         assert chunk.text[:1].strip() != ""
         assert text[chunk.start_char] == chunk.text[0]
+
+
+def test_default_offsets_match_whitespace_splitter():
+    text = "visit https://example.com and foo@bar.com now"
+    assert list(iter_word_offsets(text)) == list(
+        WhitespaceTokenSplitter()(text, lower=False)
+    )
+
+
+def test_char_splitter_chunks_on_character_boundaries():
+    text = "我爱北京Tiananmen"
+    tokens = list(iter_word_offsets(text, word_splitter="char"))
+    assert [tok for tok, _, _ in tokens] == ["我", "爱", "北", "京", "Tiananmen"]
+    chunks = split_text_into_chunks(
+        text, chunk_size=2, chunk_overlap=1, word_splitter=CharLevelSplitter()
+    )
+    assert chunks[0].text == "我爱"
+    assert text[chunks[0].start_char:chunks[0].end_char] == "我爱"
+
+
+def test_custom_callable_splitter_drives_chunk_windows():
+    def every_char(text, lower=True):
+        for index, char in enumerate(text):
+            if not char.isspace():
+                yield char, index, index + 1
+
+    text = "ab cd"
+    chunks = split_text_into_chunks(
+        text, chunk_size=2, chunk_overlap=0, word_splitter=every_char
+    )
+    assert [chunk.text for chunk in chunks] == ["ab", "cd"]

@@ -15,16 +15,39 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Pattern, Union
 
+from pydantic import BaseModel
+
 from gliner2.inference.schema_model import SchemaInput
+
+
+def _configs_to_builder(
+    value: Union[List[str], Dict[str, Union[str, BaseModel]]],
+) -> Union[List[str], Dict[str, Union[str, Dict[str, Any]]]]:
+    """Turn validated entity/relation configs into the builder's dict form."""
+    if isinstance(value, list):
+        return value
+    return {
+        name: config.model_dump(exclude_none=True) if isinstance(config, BaseModel) else config
+        for name, config in value.items()
+    }
+
+
+def _compact_config(config: Dict[str, Any]) -> Union[str, Dict[str, Any]]:
+    """Collapse a description-only config to its description string."""
+    if set(config) == {"description"}:
+        return config["description"]
+    return config
 
 
 # =============================================================================
 # Validators
 # =============================================================================
 
+
 @dataclass
 class RegexValidator:
     """Regex-based span filter for post-processing."""
+
     pattern: str | Pattern[str]
     mode: Literal["full", "partial"] = "full"
     exclude: bool = False
@@ -36,7 +59,8 @@ class RegexValidator:
             raise ValueError(f"mode must be 'full' or 'partial', got {self.mode!r}")
         try:
             compiled = (
-                self.pattern if isinstance(self.pattern, re.Pattern)
+                self.pattern
+                if isinstance(self.pattern, re.Pattern)
                 else re.compile(self.pattern, self.flags)
             )
         except re.error as err:
@@ -55,6 +79,7 @@ class RegexValidator:
 # =============================================================================
 # Schema Builder
 # =============================================================================
+
 
 @dataclass
 class AttributeGroup:
@@ -81,7 +106,7 @@ class StructureBuilder:
 
     def __init__(
         self,
-        schema: 'Schema',
+        schema: "Schema",
         parent: str,
         *,
         mode: Optional[str] = None,
@@ -110,7 +135,7 @@ class StructureBuilder:
         validators: Optional[List[RegexValidator]] = None,
         cardinality: Optional[str] = None,
         exclusive: bool = False,
-    ) -> 'StructureBuilder':
+    ) -> "StructureBuilder":
         """Add a field to the structure.
 
         ``cardinality`` (``"optional_one" | "required_one" | "zero_or_more" |
@@ -172,7 +197,8 @@ class Schema:
             "entities": OrderedDict(),
             "relations": [],
             "json_descriptions": {},
-            "entity_descriptions": OrderedDict()
+            "entity_descriptions": OrderedDict(),
+            "relation_descriptions": OrderedDict(),
         }
         self._field_metadata = {}
         self._entity_metadata = {}
@@ -190,20 +216,27 @@ class Schema:
         if threshold is not None and not 0 <= threshold <= 1:
             raise ValueError(f"Threshold must be 0-1, got {threshold}")
         self._field_metadata[f"{parent}.{field}"] = {
-            "dtype": dtype, "threshold": threshold, "choices": choices,
-            "validators": validators or []
+            "dtype": dtype,
+            "threshold": threshold,
+            "choices": choices,
+            "validators": validators or [],
         }
 
-    def _store_entity_metadata(self, entity, dtype, threshold):
+    def _store_entity_metadata(self, entity, dtype, threshold, validators=None):
         if threshold is not None and not 0 <= threshold <= 1:
             raise ValueError(f"Threshold must be 0-1, got {threshold}")
-        self._entity_metadata[entity] = {"dtype": dtype, "threshold": threshold}
+        self._entity_metadata[entity] = {
+            "dtype": dtype,
+            "threshold": threshold,
+            "validators": validators or [],
+        }
 
     def _store_field_order(self, parent, order):
         self._field_orders[parent] = order
 
     def _store_record_metadata(self, parent, *, mode, anchor, occurrence_policy, fields):
         from gliner2.processing.records import VALID_MODES, VALID_OCCURRENCE_POLICIES
+
         if mode not in VALID_MODES:
             raise ValueError(f"structure mode must be one of {VALID_MODES}, got {mode!r}")
         if mode == "natural":
@@ -217,9 +250,7 @@ class Schema:
                     )
                 anchor = order[0]
             if anchor not in order:
-                raise ValueError(
-                    f"structure {parent!r} anchor {anchor!r} is not a declared field"
-                )
+                raise ValueError(f"structure {parent!r} anchor {anchor!r} is not a declared field")
         elif anchor:
             raise ValueError(f"structure {parent!r} mode={mode!r} must not set an anchor")
         if occurrence_policy is not None and occurrence_policy not in VALID_OCCURRENCE_POLICIES:
@@ -263,21 +294,46 @@ class Schema:
         labels: Union[List[str], Dict[str, str]],
         multi_label: bool = False,
         cls_threshold: float = 0.5,
-        **kwargs
-    ) -> 'Schema':
-        """Add classification task."""
+        top_k: Optional[int] = None,
+        **kwargs,
+    ) -> "Schema":
+        """Add classification task.
+
+        Args:
+            task: Task name.
+            labels: Label names, or a mapping of label name to description.
+            multi_label: Allow more than one label.
+            cls_threshold: Multi-label selection cutoff in [0, 1].
+            top_k: Keep at most this many labels, highest probability first.
+                Only multi-label tasks can return more than one label.
+            **kwargs: Extra task options (``class_act``, ``prompt``, ``examples``).
+
+        Returns:
+            This schema, for chaining.
+
+        Raises:
+            ValueError: ``cls_threshold`` is outside [0, 1] or ``top_k`` < 1.
+        """
         if self._active_builder:
             self._active_builder._auto_finish()
             self._active_builder = None
+        if not 0 <= cls_threshold <= 1:
+            raise ValueError(f"cls_threshold must be 0-1, got {cls_threshold}")
+        if top_k is not None and top_k < 1:
+            raise ValueError(f"top_k must be >= 1, got {top_k}")
 
         label_names = list(labels.keys()) if isinstance(labels, dict) else labels
         label_descs = labels if isinstance(labels, dict) else None
 
         config = {
-            "task": task, "labels": label_names,
-            "multi_label": multi_label, "cls_threshold": cls_threshold,
-            "true_label": ["N/A"], **kwargs
+            "task": task,
+            "labels": label_names,
+            "multi_label": multi_label,
+            "cls_threshold": cls_threshold,
+            **kwargs,
         }
+        if top_k is not None:
+            config["top_k"] = top_k
         if label_descs:
             config["label_descriptions"] = label_descs
 
@@ -288,8 +344,9 @@ class Schema:
         self,
         entity_types: Union[str, List[str], Dict[str, Union[str, Dict]]],
         dtype: Literal["str", "list"] = "list",
-        threshold: Optional[float] = None
-    ) -> 'Schema':
+        threshold: Optional[float] = None,
+        validators: Optional[List[RegexValidator]] = None,
+    ) -> "Schema":
         """Add entity extraction task."""
         if self._active_builder:
             self._active_builder._auto_finish()
@@ -305,7 +362,8 @@ class Schema:
             self._store_entity_metadata(
                 name,
                 config.get("dtype", dtype),
-                config.get("threshold", threshold)
+                config.get("threshold", threshold),
+                config.get("validators", validators),
             )
 
             if "description" in config:
@@ -313,9 +371,7 @@ class Schema:
 
         return self
 
-    def entity_attributes(
-        self, groups: Dict[str, AttributeGroup]
-    ) -> 'Schema':
+    def entity_attributes(self, groups: Dict[str, AttributeGroup]) -> "Schema":
         """Attach attribute groups to entities declared by this schema.
 
         Model-facing attribute labels are added to the internal entity schema, but
@@ -333,9 +389,7 @@ class Schema:
         content_entities = set(self._entity_order)
         for group_name, group in groups.items():
             if not isinstance(group, AttributeGroup):
-                raise TypeError(
-                    f"Attribute group '{group_name}' must be an AttributeGroup"
-                )
+                raise TypeError(f"Attribute group '{group_name}' must be an AttributeGroup")
             if not group_name or group_name in reserved:
                 raise ValueError(
                     f"Invalid attribute group name {group_name!r}: must be non-empty "
@@ -360,9 +414,7 @@ class Schema:
                 if not label or not label.strip():
                     raise ValueError(f"Attribute group '{group_name}' has an empty label")
                 if label in group_seen:
-                    raise ValueError(
-                        f"Label '{label}' is duplicated within group '{group_name}'"
-                    )
+                    raise ValueError(f"Label '{label}' is duplicated within group '{group_name}'")
                 group_seen.add(label)
                 if label in seen:
                     raise ValueError(
@@ -417,8 +469,8 @@ class Schema:
     def relations(
         self,
         relation_types: Union[str, List[str], Dict[str, Union[str, Dict]]],
-        threshold: Optional[float] = None
-    ) -> 'Schema':
+        threshold: Optional[float] = None,
+    ) -> "Schema":
         """Add relation extraction task."""
         if self._active_builder:
             self._active_builder._auto_finish()
@@ -431,7 +483,11 @@ class Schema:
         elif isinstance(relation_types, dict):
             relations = {}
             for name, config in relation_types.items():
-                relations[name] = {"description": config} if isinstance(config, str) else (config if isinstance(config, dict) else {})
+                relations[name] = (
+                    {"description": config}
+                    if isinstance(config, str)
+                    else (config if isinstance(config, dict) else {})
+                )
         else:
             raise ValueError("Invalid relation_types format")
 
@@ -445,6 +501,9 @@ class Schema:
             if rel_threshold is not None and not 0 <= rel_threshold <= 1:
                 raise ValueError(f"Threshold must be 0-1, got {rel_threshold}")
             self._relation_metadata[name] = {"threshold": rel_threshold}
+            description = config.get("description")
+            if description:
+                self.schema["relation_descriptions"][name] = description
 
         return self
 
@@ -458,18 +517,19 @@ class Schema:
         return self.schema
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'Schema':
+    def from_dict(cls, data: Dict[str, Any]) -> "Schema":
         """Create a Schema from a dictionary.
 
         Args:
             data: Dictionary with optional keys: entities, structures,
-                  classifications, relations
+                  classifications, relations, entity_attributes
 
         Returns:
             Schema: Constructed schema instance
 
         Raises:
-            ValidationError: If the input data is invalid
+            ValidationError: If the input data is invalid or has unknown keys
+            ValueError: If the builder rejects the validated schema
 
         Example:
             >>> schema_dict = {
@@ -494,7 +554,14 @@ class Schema:
         schema = cls()
 
         if validated.entities is not None:
-            schema.entities(validated.entities)
+            schema.entities(_configs_to_builder(validated.entities))
+            if validated.entity_attributes is not None:
+                schema.entity_attributes(
+                    {
+                        name: AttributeGroup(**group.model_dump())
+                        for name, group in validated.entity_attributes.items()
+                    }
+                )
 
         if validated.structures is not None:
             for struct_name, struct_input in validated.structures.items():
@@ -510,6 +577,7 @@ class Schema:
                         dtype=field_input.dtype,
                         choices=field_input.choices,
                         description=field_input.description,
+                        threshold=field_input.threshold,
                         cardinality=field_input.cardinality,
                         exclusive=field_input.exclusive,
                     )
@@ -517,19 +585,25 @@ class Schema:
 
         if validated.classifications is not None:
             for cls_input in validated.classifications:
+                extras = cls_input.model_dump(
+                    include={"class_act", "prompt", "examples"}, exclude_none=True
+                )
                 schema.classification(
                     task=cls_input.task,
                     labels=cls_input.labels,
-                    multi_label=cls_input.multi_label
+                    multi_label=cls_input.multi_label,
+                    cls_threshold=cls_input.cls_threshold,
+                    top_k=cls_input.top_k,
+                    **extras,
                 )
 
         if validated.relations is not None:
-            schema.relations(validated.relations)
+            schema.relations(_configs_to_builder(validated.relations))
 
         return schema
 
     @classmethod
-    def from_json(cls, json_str: str) -> 'Schema':
+    def from_json(cls, json_str: str) -> "Schema":
         """Create a Schema from a JSON string.
 
         Args:
@@ -573,11 +647,38 @@ class Schema:
             self._active_builder = None
         result = {}
 
-        if self.schema["entities"]:
-            if self.schema["entity_descriptions"]:
-                result["entities"] = dict(self.schema["entity_descriptions"])
-            else:
-                result["entities"] = list(self.schema["entities"].keys())
+        if self._entity_order:
+            entity_configs = {}
+            for name in self._entity_order:
+                config = {}
+                description = self.schema["entity_descriptions"].get(name)
+                if description:
+                    config["description"] = description
+                metadata = self._entity_metadata.get(name, {})
+                if metadata.get("dtype", "list") != "list":
+                    config["dtype"] = metadata["dtype"]
+                if metadata.get("threshold") is not None:
+                    config["threshold"] = metadata["threshold"]
+                entity_configs[name] = config
+            result["entities"] = (
+                {name: _compact_config(c) for name, c in entity_configs.items()}
+                if any(entity_configs.values())
+                else list(self._entity_order)
+            )
+
+        if self._entity_attribute_groups:
+            result["entity_attributes"] = {}
+            for group_name, group in self._entity_attribute_groups.items():
+                group_def: Dict[str, Any] = {"labels": list(group.labels)}
+                if group.multi_label:
+                    group_def["multi_label"] = True
+                if group.threshold != 0.5:
+                    group_def["threshold"] = group.threshold
+                if group.applies_to is not None:
+                    group_def["applies_to"] = list(group.applies_to)
+                if group.qualify_labels:
+                    group_def["qualify_labels"] = True
+                result["entity_attributes"][group_name] = group_def
 
         if self.schema["json_structures"]:
             result["structures"] = {}
@@ -603,9 +704,16 @@ class Schema:
                         if choices:
                             field_def["choices"] = choices
 
-                        desc = self.schema.get("json_descriptions", {}).get(struct_name, {}).get(field_name)
+                        desc = (
+                            self.schema.get("json_descriptions", {})
+                            .get(struct_name, {})
+                            .get(field_name)
+                        )
                         if desc:
                             field_def["description"] = desc
+
+                        if metadata.get("threshold") is not None:
+                            field_def["threshold"] = metadata["threshold"]
 
                         rec_fields = self._record_metadata.get(struct_name, {}).get("fields", {})
                         fmeta = rec_fields.get(field_name, {})
@@ -629,17 +737,40 @@ class Schema:
         if self.schema["classifications"]:
             result["classifications"] = []
             for cls_config in self.schema["classifications"]:
+                label_descs = cls_config.get("label_descriptions")
                 cls_def = {
                     "task": cls_config["task"],
-                    "labels": cls_config["labels"]
+                    "labels": dict(label_descs) if label_descs else list(cls_config["labels"]),
                 }
                 if cls_config.get("multi_label", False):
                     cls_def["multi_label"] = True
+                if cls_config.get("cls_threshold", 0.5) != 0.5:
+                    cls_def["cls_threshold"] = cls_config["cls_threshold"]
+                for key in ("top_k", "class_act", "prompt"):
+                    if cls_config.get(key) is not None:
+                        cls_def[key] = cls_config[key]
+                if cls_config.get("examples"):
+                    cls_def["examples"] = [list(pair) for pair in cls_config["examples"]]
                 result["classifications"].append(cls_def)
 
         if self.schema["relations"]:
-            result["relations"] = self._relation_order if self._relation_order else [
-                list(rel_dict.keys())[0] for rel_dict in self.schema["relations"]
-            ]
+            relation_order = (
+                self._relation_order
+                if self._relation_order
+                else [list(rel_dict.keys())[0] for rel_dict in self.schema["relations"]]
+            )
+            relation_configs = {}
+            for name in relation_order:
+                config = {}
+                description = self.schema["relation_descriptions"].get(name)
+                if description:
+                    config["description"] = description
+                rel_threshold = self._relation_metadata.get(name, {}).get("threshold")
+                if rel_threshold is not None:
+                    config["threshold"] = rel_threshold
+                relation_configs[name] = config
+            result["relations"] = (
+                relation_configs if any(relation_configs.values()) else relation_order
+            )
 
         return result

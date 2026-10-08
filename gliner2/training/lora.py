@@ -19,99 +19,33 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from peft import LoraConfig as PeftLoraConfig, get_peft_model, PeftModel
-from peft.tuners.lora.layer import LoraLayer as _PeftLoraLayer
 from safetensors.torch import load_file, save_file
+
+try:
+    from peft import LoraConfig as PeftLoraConfig, get_peft_model, PeftModel
+    from peft.tuners.lora.layer import LoraLayer as _PeftLoraLayer
+except ModuleNotFoundError as exc:
+    if exc.name != "peft":
+        raise
+    raise ImportError(
+        "LoRA support requires the optional 'peft' package, which is not installed. "
+        'Install it with: pip install "gliner2[train]" for training, or '
+        'pip install "gliner2[local]" for inference.'
+    ) from exc
+
+from gliner2.training.lora_targets import (  # noqa: F401 - compatibility exports
+    ENCODER_PATTERNS,
+    TASK_MODULES,
+    _alias_targets,
+    _resolve_targets,
+    _task_module_names,
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Core (non-deprecated) — mirrors Gliner2Internal main
 # ---------------------------------------------------------------------------
-
-ENCODER_PATTERNS = ["query", "key", "value", "dense"]
-# Legacy fallback for models that predate ``task_module_names()`` (span heads).
-TASK_MODULES = ["span_rep", "classifier", "count_embed", "count_pred"]
-
-
-def _task_module_names(model: nn.Module) -> tuple[str, ...]:
-    """Architecture-aware task-head module names, with a legacy fallback."""
-    method = getattr(model, "task_module_names", None)
-    if method is None:
-        return tuple(TASK_MODULES)
-    try:
-        return tuple(method())
-    except Exception:  # noqa: BLE001 - be robust to unusual models
-        return tuple(TASK_MODULES)
-
-
-def _has_module(model: nn.Module, name: str) -> bool:
-    return any(n == name or n.startswith(f"{name}.") for n, _ in model.named_modules())
-
-
-def _alias_targets(model: nn.Module, alias: str) -> tuple[str, ...]:
-    """Expand a high-level LoRA alias into concrete task-module name prefixes.
-
-    Aliases are architecture-neutral: they map through the model's own
-    ``task_module_names()`` rather than any hard-coded global head list.
-    """
-    task_modules = _task_module_names(model)
-    if alias == "all_task_heads":
-        return task_modules
-    if alias == "classification_head":
-        return ("classifier",) if _has_module(model, "classifier") else ()
-    if alias == "extractive_head":
-        if _has_module(model, "boundary_head"):
-            return ("boundary_head",)
-        return tuple(m for m in ("span_rep", "count_embed", "count_pred") if _has_module(model, m))
-    if alias == "relation_head":
-        return tuple(m for m in ("relation_scorer",) if _has_module(model, m))
-    if alias == "record_head":
-        return tuple(m for m in ("record_decoder",) if _has_module(model, m))
-    return ()
-
-
-def _resolve_targets(model: nn.Module, targets: list[str]) -> list[str]:
-    """Map high-level target names to concrete Linear layer paths.
-
-    Args:
-        model: The model to resolve targets against.
-        targets: High-level target names. Supported forms:
-            * ``"encoder"`` / ``"encoder.<pattern>"`` — encoder attention/FFN.
-            * task-module names from the model's ``task_module_names()``
-              (e.g. ``"classifier"``, ``"boundary_head"``, ``"span_rep"``).
-            * high-level aliases: ``"extractive_head"``,
-              ``"classification_head"``, ``"relation_head"``, ``"record_head"``,
-              ``"all_task_heads"`` — mapped through the model architecture.
-
-    Returns:
-        Sorted list of fully-qualified module paths suitable for
-        passing directly to ``peft.LoraConfig(target_modules=...)``.
-    """
-    task_modules = set(_task_module_names(model)) | set(TASK_MODULES)
-
-    # Expand aliases to concrete task-module prefixes.
-    head_prefixes: set[str] = set()
-    for t in targets:
-        for expanded in _alias_targets(model, t):
-            head_prefixes.add(expanded)
-        if t in task_modules:
-            head_prefixes.add(t)
-
-    selected: list[str] = []
-    for name, mod in model.named_modules():
-        if not isinstance(mod, nn.Linear):
-            continue
-        local = name.split(".")[-1]
-        for t in targets:
-            if t == "encoder" and name.startswith("encoder.") and any(p in local for p in ENCODER_PATTERNS):
-                selected.append(name)
-            elif t.startswith("encoder.") and name.startswith("encoder.") and t.split(".", 1)[1] in local:
-                selected.append(name)
-        for prefix in head_prefixes:
-            if name == prefix or name.startswith(f"{prefix}."):
-                selected.append(name)
-    return sorted(set(selected))
 
 
 def _deprecation(name: str, replacement: str) -> None:
@@ -400,7 +334,26 @@ def unload_lora_adapter(model: nn.Module) -> int:
         count = sum(1 for m in model.modules() if isinstance(m, _PeftLoraLayer))
         model.unload()
         return count
-    return 0
+    # `model` is not itself a `PeftModel` instance whenever it went through
+    # load_lora_adapter()'s legacy (non-peft-native) path: that path calls
+    # get_peft_model(model, ...), which injects LoraLayer modules directly
+    # into `model`'s own submodule tree in place, then discards the
+    # PeftModel wrapper it returns. `model` stays a plain nn.Module even
+    # though it now contains live LoraLayer submodules, so the
+    # isinstance(model, PeftModel) check above is always False for that
+    # path and this function used to silently no-op — has_adapter/
+    # _lora_layers bookkeeping would reset, but the injected LoraLayer
+    # modules kept running in every subsequent forward pass. Detect and
+    # unwrap that case directly: replace each injected LoraLayer with its
+    # original frozen base layer (LoRA never modifies base-layer weights,
+    # so this exactly restores pre-adapter behavior).
+    count = 0
+    for parent in list(model.modules()):
+        for child_name, child in list(parent.named_children()):
+            if isinstance(child, _PeftLoraLayer):
+                setattr(parent, child_name, child.get_base_layer())
+                count += 1
+    return count
 
 
 def has_lora_adapter(model: nn.Module) -> bool:

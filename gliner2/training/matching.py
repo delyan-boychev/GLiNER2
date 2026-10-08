@@ -31,7 +31,9 @@ def linear_sum_assignment(cost_matrix: torch.Tensor) -> Tuple[torch.LongTensor, 
     """
     if cost_matrix.ndim != 2:
         raise ValueError("cost_matrix must be 2-D")
-    cost = cost_matrix.detach().to(torch.float64).cpu()
+    # MPS does not support float64 tensors. Transfer first, then promote on CPU
+    # for the numerically stable Hungarian solve.
+    cost = cost_matrix.detach().cpu().to(torch.float64)
     if torch.isnan(cost).any():
         raise ValueError("cost_matrix contains NaN")
     # Map +/-inf to large finite sentinels so a fully-infinite row still admits

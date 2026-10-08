@@ -48,7 +48,7 @@ import shutil
 import sys
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields as dataclass_fields, is_dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -63,6 +63,7 @@ import torch.distributed as dist
 from tqdm.auto import tqdm
 
 from gliner2.processor import SchemaTransformer, SamplingConfig
+from gliner2.utils.device_errors import is_fatal_device_error
 from gliner2.utils.sync_probe import count_cuda_syncs
 
 # Import training data classes
@@ -74,9 +75,6 @@ from gliner2.training.sampler import (
     DistributedLengthGroupedSampler,
     LengthGroupedSampler,
 )
-
-from peft import PeftModel
-from peft.tuners.lora.layer import LoraLayer as _PeftLoraLayer
 
 logger = logging.getLogger(__name__)
 
@@ -227,8 +225,12 @@ class TrainingConfig:
 
     # Strict training invariants (boundary architecture; harmless for span).
     # When strict_training is True: processor/model exceptions propagate, a
-    # non-finite loss raises, and batch-size discrepancies raise.
+    # non-finite loss raises (unless ignore_nonfinite_losses is enabled), and
+    # batch-size discrepancies raise. ``skip_step_errors`` is an explicit
+    # single-process recovery override for faulty micro-batches.
     strict_training: bool = True
+    ignore_nonfinite_losses: bool = False
+    skip_step_errors: bool = False
     allow_invalid_samples: bool = False
     log_proposal_metrics: bool = True
     gold_injection_start: float = 1.0
@@ -236,6 +238,8 @@ class TrainingConfig:
     gold_injection_hold_frac: float = 0.15
     diagnostics_every_n_steps: int = 0
     profile_first_n_steps: int = 0
+    # Dump complete CPU-side preprocessed batches before these global steps.
+    debug_global_steps: List[int] = field(default_factory=list)
     ddp_consensus_check: bool = True
     ddp_find_unused_parameters: bool = False
     ddp_static_graph: bool = True
@@ -245,6 +249,11 @@ class TrainingConfig:
     # Gold-capacity overflow policy for boundary targets: "raise" (default,
     # no silent loss), "truncate_with_warning", or "skip_sample".
     on_capacity_exceeded: str = "raise"
+    # Filter an entity query's independently re-searched listed-value matches
+    # down to the maximal, non-contained spans before they become gold
+    # mentions (see boundary_preprocessing._dedupe_contained_spans). Defaults
+    # to the corrected behavior; set False to restore the pre-fix behavior.
+    dedupe_contained_entity_spans: bool = True
     group_by_length: bool = True
     length_group_window_batches: int = 50
     compile_model: bool = False
@@ -506,6 +515,8 @@ class ExtractorCollator:
             max_gold_per_query: Optional[int] = 32,
             build_targets: Optional[bool] = None,
             on_capacity_exceeded: str = "raise",
+            allow_invalid_samples: bool = False,
+            dedupe_contained_entity_spans: bool = True,
     ):
         self.processor = processor
         self.is_training = is_training
@@ -519,6 +530,11 @@ class ExtractorCollator:
         # Gold-capacity overflow policy (raise | truncate_with_warning |
         # skip_sample); defaults to the no-silent-loss "raise".
         self.on_capacity_exceeded = on_capacity_exceeded
+        self.allow_invalid_samples = allow_invalid_samples
+        # Filter phantom contained-span entity matches (see
+        # gliner2.processing.boundary_preprocessing._dedupe_contained_spans);
+        # defaults to the corrected behavior.
+        self.dedupe_contained_entity_spans = dedupe_contained_entity_spans
 
     def __call__(self, batch: List[Tuple[str, Dict]]):
         """
@@ -531,18 +547,32 @@ class ExtractorCollator:
             PreprocessedBatch ready for model.forward()
         """
         if self.is_training:
-            return self.processor.collate_fn_train(
-                batch, max_len=self.max_len, architecture=self.architecture,
+            kwargs = dict(
+                max_len=self.max_len, architecture=self.architecture,
                 max_gold_per_query=self.max_gold_per_query,
                 on_capacity_exceeded=self.on_capacity_exceeded,
+                dedupe_contained_entity_spans=self.dedupe_contained_entity_spans,
             )
+            if self.allow_invalid_samples:
+                kwargs.update(
+                    error_policy="skip",
+                    ignore_missing_entities=True,
+                )
+            return self.processor.collate_fn_train(batch, **kwargs)
         else:
-            return self.processor.collate_fn_inference(
-                batch, max_len=self.max_len, architecture=self.architecture,
+            kwargs = dict(
+                max_len=self.max_len, architecture=self.architecture,
                 build_targets=self.build_targets,
                 max_gold_per_query=self.max_gold_per_query,
                 on_capacity_exceeded=self.on_capacity_exceeded,
+                dedupe_contained_entity_spans=self.dedupe_contained_entity_spans,
             )
+            if self.allow_invalid_samples:
+                kwargs.update(
+                    error_policy="skip",
+                    ignore_missing_entities=True,
+                )
+            return self.processor.collate_fn_inference(batch, **kwargs)
 
 
 # =============================================================================
@@ -784,6 +814,11 @@ class ExtractorTrainer:
                 self.config.fp16 = False
                 self.config.bf16 = False
         self.model.to(self.device)
+        if not self.config.fp16 and not self.config.bf16:
+            # Some encoder backends preserve a reduced parameter dtype when
+            # loaded from a checkpoint. Full-precision training must normalize
+            # every module before its activations reach FP32 task heads.
+            self.model.float()
         logger.info(f"Using device: {self.device}")
 
     def _setup_output_dir(self):
@@ -825,6 +860,8 @@ class ExtractorTrainer:
         if not self.config.use_lora:
             logger.info("LoRA is disabled")
             return
+
+        from gliner2.training.lora import _PeftLoraLayer
 
         for p in self.model.parameters():
             p.requires_grad = False
@@ -875,6 +912,149 @@ class ExtractorTrainer:
         if denominator == 0:
             return default
         return numerator / denominator
+
+    def _record_failed_batch(
+        self,
+        batch: Any,
+        *,
+        data_loader_step: int,
+        error: BaseException,
+    ) -> None:
+        """Persist CPU-side sample contents without touching a failed device."""
+        try:
+            texts = list(getattr(batch, "original_texts", ()) or ())
+            schemas = list(getattr(batch, "original_schemas", ()) or ())
+            samples = []
+            for sample_index in range(max(len(texts), len(schemas))):
+                text = texts[sample_index] if sample_index < len(texts) else None
+                schema = schemas[sample_index] if sample_index < len(schemas) else None
+                canonical = json.dumps(
+                    {"text": text, "schema": schema},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=repr,
+                )
+                samples.append({
+                    "sample_index": sample_index,
+                    "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                    "text": text,
+                    "schema": schema,
+                })
+
+            rank = dist.get_rank() if self.is_distributed else 0
+            record = {
+                "timestamp": datetime.now().isoformat(),
+                "rank": rank,
+                "epoch": self.epoch,
+                "global_step": self.global_step,
+                "data_loader_step": data_loader_step,
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "samples": samples,
+            }
+            path = self.output_dir / (
+                "failed_batches.jsonl"
+                if not self.is_distributed
+                else f"failed_batches.rank-{rank}.jsonl"
+            )
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, default=repr))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            logger.error(
+                "Recorded failing batch with %d sample(s) in %s",
+                len(samples),
+                path,
+            )
+        except Exception:
+            # Diagnostics must never replace the original training exception.
+            logger.exception("Could not record failing batch diagnostics")
+
+    @classmethod
+    def _diagnostic_json_value(cls, value: Any) -> Any:
+        """Convert nested batch state, including tensors, to lossless JSON data."""
+        if isinstance(value, torch.Tensor):
+            tensor = value.detach().cpu()
+            return {
+                "__type__": "tensor",
+                "dtype": str(tensor.dtype),
+                "shape": list(tensor.shape),
+                "values": tensor.tolist(),
+            }
+        if isinstance(value, np.ndarray):
+            return {
+                "__type__": "ndarray",
+                "dtype": str(value.dtype),
+                "shape": list(value.shape),
+                "values": value.tolist(),
+            }
+        if isinstance(value, np.generic):
+            return value.item()
+        if is_dataclass(value) and not isinstance(value, type):
+            result = {"__type__": type(value).__name__}
+            result.update({
+                item.name: cls._diagnostic_json_value(getattr(value, item.name))
+                for item in dataclass_fields(value)
+            })
+            return result
+        if isinstance(value, dict):
+            return {
+                str(key): cls._diagnostic_json_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._diagnostic_json_value(item) for item in value]
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if hasattr(value, "__dict__"):
+            result = {"__type__": type(value).__name__}
+            result.update({
+                str(key): cls._diagnostic_json_value(item)
+                for key, item in vars(value).items()
+            })
+            return result
+        return repr(value)
+
+    def _record_debug_batch(
+        self,
+        batch: Any,
+        *,
+        data_loader_step: int,
+        micro_batch_in_window: int,
+        is_last_micro: bool,
+    ) -> None:
+        """Dump a complete pre-GPU batch for a configured diagnostic step."""
+        try:
+            rank = dist.get_rank() if self.is_distributed else 0
+            record = {
+                "timestamp": datetime.now().isoformat(),
+                "rank": rank,
+                "epoch": self.epoch,
+                "global_step_before_batch": self.global_step,
+                "data_loader_step": data_loader_step,
+                "micro_batch_in_window": micro_batch_in_window,
+                "is_last_micro": is_last_micro,
+                "batch": self._diagnostic_json_value(batch),
+            }
+            path = self.output_dir / (
+                "debug_batches.jsonl"
+                if not self.is_distributed
+                else f"debug_batches.rank-{rank}.jsonl"
+            )
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            logger.warning(
+                "Recorded full pre-GPU batch for global step %d in %s",
+                self.global_step,
+                path,
+            )
+        except Exception:
+            # Diagnostics must never introduce a new training failure.
+            logger.exception("Could not record configured batch diagnostics")
 
     def _get_model_config(self) -> Any:
         """Return the underlying model config, handling DDP-wrapped models."""
@@ -1078,7 +1258,7 @@ class ExtractorTrainer:
         self._skip_counter.zero_()
         if skipped:
             message = f"{skipped} non-finite micro-batch loss(es) were zeroed"
-            if self.config.strict_training:
+            if self.config.strict_training and not self.config.ignore_nonfinite_losses:
                 raise FloatingPointError(message)
             logger.warning(message)
 
@@ -1352,6 +1532,8 @@ class ExtractorTrainer:
             architecture=architecture, max_gold_per_query=max_gold,
             build_targets=None if is_training else True,
             on_capacity_exceeded=self.config.on_capacity_exceeded,
+            allow_invalid_samples=self.config.allow_invalid_samples,
+            dedupe_contained_entity_spans=self.config.dedupe_contained_entity_spans,
         )
 
         # Fix Bug #1 & #9: Handle small datasets
@@ -1534,6 +1716,13 @@ class ExtractorTrainer:
                 is_last_micro = (
                     (micro + 1) % accum == 0 or step + 1 == len(train_loader)
                 )
+                if self.global_step in self.config.debug_global_steps:
+                    self._record_debug_batch(
+                        batch,
+                        data_loader_step=step,
+                        micro_batch_in_window=micro,
+                        is_last_micro=is_last_micro,
+                    )
 
                 try:
                     profile_step = self.global_step < self.config.profile_first_n_steps
@@ -1576,7 +1765,10 @@ class ExtractorTrainer:
                             amp_dtype,
                             is_last_micro=is_last_micro,
                         )
-                except torch.cuda.OutOfMemoryError:
+                except torch.cuda.OutOfMemoryError as exc:
+                    self._record_failed_batch(
+                        batch, data_loader_step=step, error=exc
+                    )
                     # Discard the whole in-flight window: its partial gradients
                     # are unusable, so zero them and restart accumulation. Log
                     # the discarded count so the loss is visible, not silent.
@@ -1587,6 +1779,27 @@ class ExtractorTrainer:
                     )
                     torch.cuda.empty_cache()
                     gc.collect()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    micro = 0
+                    continue
+                except Exception as exc:
+                    self._record_failed_batch(
+                        batch, data_loader_step=step, error=exc
+                    )
+                    if is_fatal_device_error(exc):
+                        raise
+                    if not self.config.skip_step_errors or self.is_distributed:
+                        raise
+                    # A failed forward/backward may have left partial gradients
+                    # in the accumulation window. Drop the whole window before
+                    # accepting another batch and retain the traceback in logs.
+                    logger.exception(
+                        "Error in micro-batch %d; discarding %d accumulated "
+                        "micro-batch(es) and continuing because "
+                        "skip_step_errors=True.",
+                        step,
+                        micro,
+                    )
                     self.optimizer.zero_grad(set_to_none=True)
                     micro = 0
                     continue
@@ -1918,13 +2131,15 @@ class ExtractorTrainer:
             trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         else:
             # Full model save: merge LoRA weights if present. Import both
-            # helpers up front: ``merge_lora_weights`` was previously
+            # helpers together: ``merge_lora_weights`` was previously
             # referenced without an import, raising NameError on the first
-            # full-checkpoint save under LoRA.
-            from gliner2.training.lora import merge_lora_weights, unmerge_lora_weights
-
+            # full-checkpoint save under LoRA. The import stays inside the
+            # LoRA branch because it needs peft, which non-LoRA training
+            # does not.
             lora_was_merged = False
             if self.config.use_lora and self.lora_layers:
+                from gliner2.training.lora import merge_lora_weights, unmerge_lora_weights
+
                 first_lora_layer = next(iter(self.lora_layers.values()))
                 if not first_lora_layer.merged:
                     num_merged = merge_lora_weights(self.model)
@@ -2009,6 +2224,8 @@ class ExtractorTrainer:
         is_adapter = (checkpoint_dir / "adapter_config.json").exists()
 
         if is_adapter:
+            from gliner2.training.lora import PeftModel, _PeftLoraLayer
+
             logger.info("Loading LoRA adapter from %s", checkpoint_path)
             base = self.model.get_base_model() if isinstance(self.model, PeftModel) else self.model
             self.model = PeftModel.from_pretrained(base, str(checkpoint_dir))
@@ -2017,6 +2234,10 @@ class ExtractorTrainer:
             self.model._lora_layers = self.lora_layers
         else:
             self.model = self.model.__class__.from_pretrained(str(checkpoint_dir))
+            # if not bf16 and not fp16, then we need to move the model to the device
+            if not self.config.bf16 and not self.config.fp16:
+                logger.info("Moving model to %s", self.device)
+                self.model.float()
             self.model.to(self.device)
             if self.config.use_lora:
                 logger.info("Applying LoRA to loaded model...")

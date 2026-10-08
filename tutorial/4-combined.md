@@ -14,14 +14,16 @@ Combining schemas allows you to:
 - Improve efficiency by avoiding multiple model calls
 - Build comprehensive information extraction pipelines
 
+For **per-span labels** (e.g. sentiment on product mentions), combine entities with [`entity_attributes`](13-span_attributes.md). For **typed relation graphs**, see [Joint IE](15-joint_ie.md).
+
 ## Basic Combinations
 
 ### Entities + Classification
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
-extractor = GLiNER2.from_pretrained("your-model-name")
+extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Sentiment analysis with entity extraction
 schema = (extractor.create_schema()

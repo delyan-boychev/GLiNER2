@@ -92,6 +92,59 @@ def test_compile_specs_respects_layout_order_and_dtype():
     assert item.cardinality == FieldCardinality.ZERO_OR_MORE
 
 
+def test_compile_specs_uses_dtype_for_implicit_scalar_cardinality():
+    schema = Schema()
+    (
+        schema.structure("transaction", mode="natural", anchor="merchant")
+        .field("merchant", dtype="str")
+        .field("date", dtype="str")
+        .field("tags", dtype="list")
+    )
+    built = schema.build()
+    layout = QueryLayout(queries=(
+        QuerySpec(
+            query_id=0,
+            task_index=0,
+            task_type="json_structures",
+            task_name="transaction",
+            role_index=0,
+            role_name="merchant",
+        ),
+        QuerySpec(
+            query_id=1,
+            task_index=0,
+            task_type="json_structures",
+            task_name="transaction",
+            role_index=1,
+            role_name="date",
+        ),
+        QuerySpec(
+            query_id=2,
+            task_index=0,
+            task_type="json_structures",
+            task_name="transaction",
+            role_index=2,
+            role_name="tags",
+        ),
+    ))
+
+    spec = compile_record_specs(
+        query_layout=layout,
+        record_metadata=built["record_metadata"],
+        field_dtypes={
+            "transaction": {
+                "merchant": "str",
+                "date": "str",
+                "tags": "list",
+            }
+        },
+    )[0]
+
+    assert spec.field_for_query(0).cardinality == FieldCardinality.REQUIRED_ONE
+    assert spec.field_for_query(1).cardinality == FieldCardinality.OPTIONAL_ONE
+    assert spec.field_for_query(2).cardinality == FieldCardinality.ZERO_OR_MORE
+
+
 def test_compile_specs_excludes_deferred_relation_groups():
     layout = QueryLayout(queries=(
         QuerySpec(query_id=0, task_index=0, task_type="relations",

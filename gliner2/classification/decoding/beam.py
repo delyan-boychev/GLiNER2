@@ -9,6 +9,8 @@ a violating assignment as if it were feasible.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from .base import Solution
 
 
@@ -19,7 +21,8 @@ def _signature(chosen, order):
 class BeamDecoder:
     name = "beam"
 
-    def decode(self, problem, *, beam_size: int = 16) -> Solution:
+    def decode(self, problem, *, beam_size: int = 16) -> Optional[Solution]:
+        """Return the best feasible Solution in the beam, or None at a dead end."""
         order = sorted(
             problem.task_order,
             key=lambda t: (-len(problem.constraints_touching(t)),
@@ -50,8 +53,9 @@ class BeamDecoder:
             if not beams:
                 # No feasible extension survived; report infeasibility rather
                 # than fabricate a greedy-max (constraint-violating) answer.
-                return Solution(assignments={}, score=float("-inf"),
-                                violations=(), exact=False, decoder=self.name)
+                # An empty Solution would read as feasible (no violations) and
+                # skip the on_infeasible ladder, so return None like ExactDecoder.
+                return None
 
         score, chosen = beams[0]
         violations = problem.violations_of(chosen)

@@ -172,6 +172,30 @@ def test_on_infeasible_min_violations(planted):
     assert result.violations
 
 
+# ---- T-E10 : budget exhaustion with a beam dead end stays typed ---------
+
+@pytest.mark.parametrize("on_infeasible", ["raise", "relax", "min_violations"])
+def test_budget_exhausted_beam_dead_end_never_raises_keyerror(planted, on_infeasible):
+    tasks = [("a", ["x", "y"]), ("b", ["p", "q"])]
+    logits = {"a": {"x": 3.0, "y": 0.0}, "b": {"p": 2.0, "q": 1.0}}
+    schema = (ClassificationSchema()
+              .single("a", ["x", "y"])
+              .single("b", ["p", "q"])
+              .constrain(C.implies(("a", "x"), ("b", "p")),
+                         C.implies(("a", "x"), ("b", "q"))))
+    clf = Classifier(planted(tasks, logits))
+    config = ClassificationConfig(decoder="exact", candidate_threshold=0.0,
+                                  exact_node_budget=1, beam_size=1,
+                                  on_infeasible=on_infeasible)
+    if on_infeasible == "raise":
+        with pytest.raises(InfeasibleError):
+            clf.classify("t", schema, config=config)
+        return
+    result = clf.classify("t", schema, config=config)
+    assert not result.feasible
+    assert result.exact is False
+
+
 # ---- T-R6 : __all__ exact ----------------------------------------------
 
 def test_public_all_is_exact():

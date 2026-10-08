@@ -1,39 +1,43 @@
 """
-Benchmark: FlashDeberta vs Standard DebertaV2 for NER Inference
+Benchmark: DeBERTa attention backends for full GLiNER2 NER inference
 
 Compares end-to-end NER extraction latency between the standard HuggingFace
-DebertaV2 backend and the FlashDeberta optimized backend.
+DebertaV2 backend, FlashDeBERTa, and DisentangledFlash.
 
 Test matrix:
   - Batch sizes: 1, 2, 4, 8
-  - Sequence lengths: 32, 128, 512, 1024, 2048 tokens
-  - Backends: standard (AutoModel) vs FlashDeberta
+  - Sequence lengths: 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 tokens
+  - Backends: standard (AutoModel), FlashDeBERTa, DisentangledFlash
 
 Protocol:
   - Model loaded once per backend (separate processes via subprocess)
-  - 5 warmup iterations (discarded)
-  - 20 measured iterations per condition
+  - Configurable warmup and measured iterations (defaults: 3 and 10)
   - Reports mean, median, stdev, speedup, peak memory
   - Welch's t-test for significance (p < 0.05)
   - Peak memory via torch.cuda (GPU) or tracemalloc (CPU)
   - CUDA synchronize before all timing points on GPU
 
 Usage:
-  # Full benchmark (runs both backends, requires flashdeberta installed):
+  # Full benchmark (runs all backends):
   python benchmarks/benchmark_flashdeberta.py
 
   # Single backend (useful for debugging):
   python benchmarks/benchmark_flashdeberta.py --backend standard
   python benchmarks/benchmark_flashdeberta.py --backend flash
+  python benchmarks/benchmark_flashdeberta.py --backend disentangled_flash
 
   # Custom settings:
-  python benchmarks/benchmark_flashdeberta.py --model fastino/gliner2-base-v1 --warmup 10 --measure 30
+  python benchmarks/benchmark_flashdeberta.py --model fastino/gliner2-base-v1 --dtype fp16 --warmup 10 --measure 30
+
+  # Isolate encoder speed from preprocessing and decoding:
+  python benchmarks/benchmark_flashdeberta.py --encoder-only
 
 Environment variables:
   USE_FLASHDEBERTA  — set automatically by the script when running flash backend
 """
 
 import argparse
+import importlib.metadata
 import json
 import os
 import statistics
@@ -41,13 +45,14 @@ import subprocess
 import sys
 import time
 import tracemalloc
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 ENTITY_TYPES = ["company", "person", "product", "location", "date"]
 
-SEQUENCE_LENGTHS = [32, 64, 128, 256, 512, 1024, 2048]
+# Extend long-context coverage through 2048 * 4 tokens.
+SEQUENCE_LENGTHS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
 BATCH_SIZES = [1, 2, 4, 8]
 
 # Seed sentence pool — repeated/truncated to reach target token counts.
@@ -75,6 +80,27 @@ _SEED_SENTENCES = [
 def sync(device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize()
+
+
+def resolve_dtype(name: Optional[str], device: torch.device) -> Tuple[str, torch.dtype]:
+    """Resolve the requested precision, defaulting to fp16 only on CUDA."""
+    resolved = name or ("fp16" if device.type == "cuda" else "fp32")
+    if device.type != "cuda" and resolved != "fp32":
+        raise RuntimeError(f"{resolved} benchmarking requires a CUDA device")
+    if resolved == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("bf16 benchmarking requires a CUDA device with bf16 support")
+    return resolved, {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }[resolved]
+
+
+def package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
 
 
 def generate_text_for_token_length(tokenizer, target_tokens: int) -> str:
@@ -113,29 +139,59 @@ def run_single_backend(
     backend: str,
     n_warmup: int,
     n_measure: int,
+    dtype_name: Optional[str],
+    architecture: str,
+    encoder_only: bool,
 ) -> Dict[str, Any]:
     """Run benchmark for a single backend. Returns JSON-serializable results."""
-    # Set env var before importing gliner2 so _load_encoder picks it up
+    # Keep the legacy environment switch aligned with the explicit API option.
     if backend == "flash":
         os.environ["USE_FLASHDEBERTA"] = "1"
     else:
         os.environ.pop("USE_FLASHDEBERTA", None)
 
-    from gliner2 import GLiNER2
+    from gliner2 import AutoExtractor
 
     print(f"\nLoading model ({backend} backend)...")
-    model = GLiNER2.from_pretrained(model_name)
+    load_kwargs = {
+        "attention_backend": "flashdeberta" if backend == "flash" else "standard"
+    }
+    if architecture != "auto":
+        load_kwargs["architecture"] = architecture
+    model = AutoExtractor.from_pretrained(model_name, **load_kwargs)
     model.eval()
 
-    # Detect actual backend
+    # Detect the construction-time backend.
     encoder_class = model.encoder.__class__.__name__
     print(f"  Encoder class: {encoder_class}")
+    if backend == "flash" and encoder_class != "FlashDebertaV2Model":
+        raise RuntimeError(
+            "FlashDeBERTa was requested but did not activate "
+            f"(loaded {encoder_class}). Verify that flashdeberta is installed "
+            "and the checkpoint uses a DebertaV2 encoder."
+        )
+    if backend == "standard" and encoder_class == "FlashDebertaV2Model":
+        raise RuntimeError("Standard backend unexpectedly loaded FlashDeBERTa")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    resolved_dtype, torch_dtype = resolve_dtype(dtype_name, device)
     if device.type == "cuda":
-        model = model.to(device)
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    model = model.to(device=device, dtype=torch_dtype)
+    if backend == "disentangled_flash":
+        model.enable_disentangled_flash()
+        if not getattr(model, "_disentangled_flash_backend", None):
+            raise RuntimeError("DisentangledFlash was requested but did not activate")
+        encoder_class = (
+            f"{encoder_class} -> {model.encoder.encoder.__class__.__name__}"
+        )
     print(f"  Device: {device}")
+    print(f"  Dtype: {resolved_dtype}")
+    print(f"  Architecture: {model.architecture}")
+    print(f"  Mode: {'encoder-only' if encoder_only else 'end-to-end'}")
+    print(f"  PyTorch: {torch.__version__}")
+    print(f"  FlashDeBERTa: {package_version('flashdeberta')}")
+    print(f"  DisentangledFlash: {package_version('disentangled-flash')}")
 
     tokenizer = model.processor.tokenizer
 
@@ -155,11 +211,28 @@ def run_single_backend(
         for bs in BATCH_SIZES:
             texts = [base_text] * bs
             cond = f"seq{seq_len}_bs{bs}"
+            encoder_inputs = None
+            if encoder_only:
+                encoder_inputs = tokenizer(
+                    texts,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                encoder_inputs = {
+                    key: value.to(device) for key, value in encoder_inputs.items()
+                }
+
+            def run_iteration():
+                if encoder_only:
+                    return model.encoder(**encoder_inputs)
+                return model.batch_extract_entities(
+                    texts, ENTITY_TYPES, batch_size=bs
+                )
 
             # Warmup
             with torch.inference_mode():
                 for _ in range(n_warmup):
-                    model.batch_extract_entities(texts, ENTITY_TYPES, batch_size=bs)
+                    run_iteration()
 
             # Measure
             timings = []
@@ -174,7 +247,7 @@ def run_single_backend(
                 for _ in range(n_measure):
                     sync(device)
                     t0 = time.perf_counter()
-                    model.batch_extract_entities(texts, ENTITY_TYPES, batch_size=bs)
+                    run_iteration()
                     sync(device)
                     timings.append(time.perf_counter() - t0)
 
@@ -208,6 +281,17 @@ def run_single_backend(
         "backend": backend,
         "encoder_class": encoder_class,
         "device": str(device),
+        "dtype": resolved_dtype,
+        "architecture": model.architecture,
+        "mode": "encoder-only" if encoder_only else "end-to-end",
+        "torch_version": torch.__version__,
+        "flashdeberta_version": package_version("flashdeberta"),
+        "disentangled_flash_version": package_version("disentangled-flash"),
+        "selected_attention_backend": (
+            getattr(model, "_disentangled_flash_backend", None)
+            if backend == "disentangled_flash"
+            else backend
+        ),
         "model_name": model_name,
         "n_warmup": n_warmup,
         "n_measure": n_measure,
@@ -323,43 +407,59 @@ def _betainc(a, b, x):
 
 
 def compare_results(
-    standard: Dict[str, Any],
-    flash: Dict[str, Any],
+    baseline: Dict[str, Any],
+    candidate: Dict[str, Any],
 ) -> None:
     """Print comparison table with speedups and significance tests."""
+    for key in ("model_name", "device", "dtype", "architecture", "mode"):
+        if baseline.get(key) != candidate.get(key):
+            raise ValueError(
+                f"Cannot compare results with different {key}: "
+                f"{baseline.get(key)!r} != {candidate.get(key)!r}"
+            )
+
+    baseline_name = baseline["backend"]
+    candidate_name = candidate["backend"]
 
     print(f"\n{'=' * 90}")
-    print("  FlashDeberta Benchmark Results")
+    print(f"  {candidate_name} vs {baseline_name} Benchmark Results")
     print(f"{'=' * 90}")
-    print(f"  Model:   {standard['model_name']}")
-    print(f"  Device:  {standard['device']}")
-    print(f"  Standard encoder: {standard['encoder_class']}")
-    print(f"  Flash encoder:    {flash['encoder_class']}")
-    print(f"  Warmup: {standard['n_warmup']}  Measured: {standard['n_measure']}")
+    print(f"  Model:   {baseline['model_name']}")
+    print(f"  Device:  {baseline['device']}")
+    print(f"  Dtype:   {baseline['dtype']}")
+    print(f"  Architecture: {baseline['architecture']}")
+    print(f"  Mode:    {baseline['mode']}")
+    print(f"  Baseline encoder:  {baseline['encoder_class']}")
+    print(f"  Candidate encoder: {candidate['encoder_class']}")
+    print(f"  Warmup: {baseline['n_warmup']}  Measured: {baseline['n_measure']}")
     print(f"{'=' * 90}")
 
     header = (
         f"  {'Condition':<20} "
-        f"{'Std mean':>10} {'Std med':>10} "
-        f"{'Flash mean':>10} {'Flash med':>10} "
+        f"{'Base mean':>10} {'Base med':>10} "
+        f"{'Cand mean':>10} {'Cand med':>10} "
         f"{'Speedup':>9} "
-        f"{'Std mem':>9} {'Flash mem':>9} {'Mem ratio':>9}"
+        f"{'p-value':>9} "
+        f"{'Base mem':>9} {'Cand mem':>9} {'Mem ratio':>9}"
     )
     print(header)
     print(f"  {'-' * 20} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} "
-          f"{'-' * 9} {'-' * 9} {'-' * 9} {'-' * 9}")
+          f"{'-' * 9} {'-' * 9} {'-' * 9} {'-' * 9} {'-' * 9}")
 
     all_speedups = []
     all_mem_ratios = []
+    significant_conditions = 0
 
-    for cond in standard["conditions"]:
-        std = standard["conditions"][cond]
-        fla = flash["conditions"][cond]
+    for cond in baseline["conditions"]:
+        std = baseline["conditions"][cond]
+        fla = candidate["conditions"][cond]
 
         std_timings = std["timings"]
         fla_timings = fla["timings"]
 
         speedup_ratio = std["median"] / fla["median"] if fla["median"] > 0 else float("inf")
+        _, p_value = _welch_ttest(std_timings, fla_timings)
+        significant_conditions += int(p_value < 0.05)
 
         std_mem = std.get("peak_memory_mb", 0)
         fla_mem = fla.get("peak_memory_mb", 0)
@@ -373,6 +473,7 @@ def compare_results(
             f"{std['mean']*1000:>9.1f}ms {std['median']*1000:>9.1f}ms "
             f"{fla['mean']*1000:>9.1f}ms {fla['median']*1000:>9.1f}ms "
             f"{speedup_ratio:>8.2f}x "
+            f"{p_value:>9.3g} "
             f"{std_mem:>8.1f}M {fla_mem:>8.1f}M {mem_ratio:>8.2f}x"
         )
 
@@ -381,15 +482,19 @@ def compare_results(
     print("  SUMMARY")
     print(f"{'=' * 90}")
 
-    total_conds = len(standard["conditions"])
+    total_conds = len(baseline["conditions"])
 
     if all_speedups:
         print(f"  Conditions tested: {total_conds}")
         print(f"  Speedup range: {min(all_speedups):.2f}x to {max(all_speedups):.2f}x")
         print(f"  Overall median speedup: {statistics.median(all_speedups):.2f}x")
+        print(
+            "  Statistically significant differences (p < 0.05): "
+            f"{significant_conditions}/{total_conds}"
+        )
 
     if all_mem_ratios:
-        print(f"\n  Peak memory ratio (std / flash, >1x = flash uses less):")
+        print("\n  Peak memory ratio (baseline / candidate, >1x = candidate uses less):")
         print(f"  Memory ratio range: {min(all_mem_ratios):.2f}x to {max(all_mem_ratios):.2f}x")
         print(f"  Overall median memory ratio: {statistics.median(all_mem_ratios):.2f}x")
 
@@ -403,6 +508,9 @@ def run_subprocess_backend(
     model_name: str,
     n_warmup: int,
     n_measure: int,
+    dtype_name: Optional[str],
+    architecture: str,
+    encoder_only: bool,
     output_file: str,
 ) -> Optional[Dict[str, Any]]:
     """Run a single backend in a subprocess to ensure clean env."""
@@ -418,8 +526,13 @@ def run_subprocess_backend(
         "--model", model_name,
         "--warmup", str(n_warmup),
         "--measure", str(n_measure),
+        "--architecture", architecture,
         "--output", output_file,
     ]
+    if dtype_name is not None:
+        cmd.extend(["--dtype", dtype_name])
+    if encoder_only:
+        cmd.append("--encoder-only")
 
     print(f"\n--- Running {backend} backend in subprocess ---")
     result = subprocess.run(cmd, env=env)
@@ -438,18 +551,32 @@ def run_subprocess_backend(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark FlashDeberta vs standard DebertaV2 for NER inference"
+        description="Benchmark GLiNER2 DeBERTa attention backends"
     )
     parser.add_argument(
-        "--backend", choices=["standard", "flash", "both"], default="both",
-        help="Which backend to benchmark (default: both)"
+        "--backend",
+        choices=["standard", "flash", "disentangled_flash", "both", "all"],
+        default="all",
+        help="Which backend to benchmark (default: all)"
     )
     parser.add_argument(
         "--model", default="fastino/gliner2-base-v1",
         help="Model name or path (default: fastino/gliner2-base-v1)"
     )
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations (default: 3)")
-    parser.add_argument("--measure", type=int, default=10, help="Measured iterations (default: 5)")
+    parser.add_argument("--measure", type=int, default=10, help="Measured iterations (default: 10)")
+    parser.add_argument(
+        "--dtype", choices=["fp32", "fp16", "bf16"], default=None,
+        help="Model precision (default: fp16 on CUDA, fp32 otherwise)"
+    )
+    parser.add_argument(
+        "--architecture", choices=["auto", "span", "boundary"], default="auto",
+        help="Extractor architecture; must match the checkpoint (default: auto)"
+    )
+    parser.add_argument(
+        "--encoder-only", action="store_true",
+        help="Benchmark only the encoder, excluding preprocessing and decoding"
+    )
     parser.add_argument(
         "--output", default=None,
         help="Output JSON file (used internally for subprocess communication)"
@@ -457,8 +584,16 @@ def main():
     args = parser.parse_args()
 
     # Single-backend mode (used by subprocess or direct invocation)
-    if args.backend in ("standard", "flash"):
-        result = run_single_backend(args.model, args.backend, args.warmup, args.measure)
+    if args.backend in ("standard", "flash", "disentangled_flash"):
+        result = run_single_backend(
+            args.model,
+            args.backend,
+            args.warmup,
+            args.measure,
+            args.dtype,
+            args.architecture,
+            args.encoder_only,
+        )
 
         if args.output:
             with open(args.output, "w") as f:
@@ -469,36 +604,80 @@ def main():
             print(json.dumps(result, indent=2, default=str))
         return
 
-    # Both backends — run each in a separate subprocess for clean state
+    # Comparison mode — run each backend in a separate subprocess for clean state.
     print("=" * 90)
-    print("  FlashDeberta NER Benchmark")
+    print("  GLiNER2 DeBERTa Attention Backend Benchmark")
     print(f"  Model: {args.model}")
     print(f"  Warmup: {args.warmup}  Measured: {args.measure}")
+    print(f"  Dtype: {args.dtype or 'auto (fp16 on CUDA)'}")
+    print(f"  Architecture: {args.architecture}")
+    print(f"  Mode: {'encoder-only' if args.encoder_only else 'end-to-end'}")
     print("=" * 90)
 
     std_file = "/tmp/flashdeberta_bench_standard.json"
     flash_file = "/tmp/flashdeberta_bench_flash.json"
+    disentangled_file = "/tmp/flashdeberta_bench_disentangled.json"
 
     std_result = run_subprocess_backend(
-        "standard", args.model, args.warmup, args.measure, std_file
+        "standard",
+        args.model,
+        args.warmup,
+        args.measure,
+        args.dtype,
+        args.architecture,
+        args.encoder_only,
+        std_file,
     )
     flash_result = run_subprocess_backend(
-        "flash", args.model, args.warmup, args.measure, flash_file
+        "flash",
+        args.model,
+        args.warmup,
+        args.measure,
+        args.dtype,
+        args.architecture,
+        args.encoder_only,
+        flash_file,
     )
 
-    if std_result is None or flash_result is None:
-        print("\nERROR: One or both backends failed. Cannot compare.")
+    disentangled_result = None
+    if args.backend == "all":
+        disentangled_result = run_subprocess_backend(
+            "disentangled_flash",
+            args.model,
+            args.warmup,
+            args.measure,
+            args.dtype,
+            args.architecture,
+            args.encoder_only,
+            disentangled_file,
+        )
+
+    required_results = [std_result, flash_result]
+    if args.backend == "all":
+        required_results.append(disentangled_result)
+    if any(result is None for result in required_results):
+        print("\nERROR: One or more backends failed. Cannot compare.")
         if std_result is None:
             print("  Standard backend failed.")
         if flash_result is None:
             print("  Flash backend failed. Is the 'flashdeberta' package installed?")
+        if args.backend == "all" and disentangled_result is None:
+            print(
+                "  DisentangledFlash backend failed. Is the "
+                "'disentangled-flash' package installed?"
+            )
         sys.exit(1)
 
     compare_results(std_result, flash_result)
+    if disentangled_result is not None:
+        compare_results(std_result, disentangled_result)
+        compare_results(flash_result, disentangled_result)
 
     # Save combined results
-    combined_file = "benchmarks/flashdeberta_results.json"
+    combined_file = "benchmarks/attention_backend_results.json"
     combined = {"standard": std_result, "flash": flash_result}
+    if disentangled_result is not None:
+        combined["disentangled_flash"] = disentangled_result
     with open(combined_file, "w") as f:
         json.dump(combined, f, indent=2, default=str)
     print(f"\n  Full results saved to {combined_file}")

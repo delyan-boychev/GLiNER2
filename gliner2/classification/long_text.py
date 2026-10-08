@@ -10,6 +10,7 @@ evidence.
 from __future__ import annotations
 
 from ..inference.chunking import split_text_into_chunks
+from ..processing.word_splitter import word_splitter_from
 from .scoring import ClassificationScores
 
 _AGGREGATIONS = ("max", "mean", "first")
@@ -48,7 +49,12 @@ def classify_long(classifier, text, schema, *, config=None, active=None,
 
     config = config or ClassificationConfig()
     compiled = classifier.compile_schema(schema)
-    chunks = split_text_into_chunks(text, chunk_size, chunk_overlap)
+    chunks = split_text_into_chunks(
+        text,
+        chunk_size,
+        chunk_overlap,
+        word_splitter=word_splitter_from(classifier),
+    )
     chunk_texts = [c.text for c in chunks]
     scores_list = classifier.batch_score(chunk_texts, compiled, config=config)
     aggregated = aggregate_scores(scores_list, compiled, text, aggregate)

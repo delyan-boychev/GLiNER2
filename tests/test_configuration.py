@@ -202,3 +202,41 @@ def test_legacy_config_json_without_architecture_loads_as_span(tmp_path):
     loaded = ExtractorConfig.from_pretrained(str(tmp_path))
     assert loaded.architecture == "span"
     assert loaded.max_width == 9
+
+
+def test_legacy_boundary_without_version_migrates_on_real_load(tmp_path):
+    legacy = {
+        "model_type": "extractor",
+        "model_name": "legacy-boundary-encoder",
+        "architecture": "boundary",
+        "boundary_head": {},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(legacy))
+
+    loaded = ExtractorConfig.from_pretrained(str(tmp_path))
+
+    assert loaded.config_version == ExtractorConfig.current_config_version
+    assert loaded.boundary_head["enable_records"] is False
+    assert loaded.boundary_head["enable_relations"] is False
+
+    loaded.save_pretrained(str(tmp_path))
+    reloaded = ExtractorConfig.from_pretrained(str(tmp_path))
+    assert reloaded.to_dict() == loaded.to_dict()
+
+
+def test_legacy_boundary_explicit_structured_heads_survive_migration(tmp_path):
+    legacy = {
+        "model_type": "extractor",
+        "model_name": "legacy-boundary-encoder",
+        "architecture": "boundary",
+        "boundary_head": {
+            "enable_records": True,
+            "enable_relations": True,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(legacy))
+
+    loaded = ExtractorConfig.from_pretrained(str(tmp_path))
+
+    assert loaded.boundary_head["enable_records"] is True
+    assert loaded.boundary_head["enable_relations"] is True

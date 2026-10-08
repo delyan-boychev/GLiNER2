@@ -203,6 +203,21 @@ def test_backward_never_skips_and_nonfinite_grads_are_zero():
     assert model.weight.grad.item() == 0.0
 
 
+def test_ignore_nonfinite_losses_keeps_strict_training_running():
+    trainer = object.__new__(ExtractorTrainer)
+    trainer.config = TrainingConfig(
+        fp16=False,
+        bf16=False,
+        strict_training=True,
+        ignore_nonfinite_losses=True,
+    )
+    trainer._skip_counter = torch.tensor(3)
+
+    trainer._flush_delayed_counters()
+
+    assert trainer._skip_counter.item() == 0
+
+
 def test_optional_head_touch_produces_zero_gradients():
     holder = nn.Module()
     holder.record_decoder = nn.Linear(3, 2)

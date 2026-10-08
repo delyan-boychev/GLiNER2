@@ -1,11 +1,13 @@
 """Raw neural scoring for joint information extraction.
 
-This module deliberately stops before candidate pruning or constrained decoding.  It
-turns GLiNER2 outputs into dense score lattices while retaining every valid span.
+This module deliberately stops before candidate pruning or constrained
+decoding. Span checkpoints produce dense :class:`ScoreLattice` objects;
+boundary checkpoints produce sparse ``CandidateScoreSet`` objects.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -164,7 +166,7 @@ def _task_name(schema_tokens: Sequence[str], fallback: str) -> str:
 
 
 class RawScorer:
-    """Compose around an existing :class:`gliner2.GLiNER2` model."""
+    """Compose around an existing span or boundary extractor model."""
 
     def __init__(self, model: Any, *, device: Optional[Union[str, torch.device]] = None,
                  dtype: Optional[Union[str, torch.dtype]] = None):
@@ -195,9 +197,13 @@ class RawScorer:
 
     @torch.inference_mode()
     def score(self, text: str, schema: Any, *, count_top_k: int = 2,
-              max_len: Optional[int] = None) -> ScoreLattice:
+              max_len: Optional[int] = None,
+              top_k_roles: Optional[int] = None,
+              relation_pair_cap: Optional[int] = None) -> Any:
         return self.batch_score([text], schema, batch_size=1, max_len=max_len,
-                                count_top_k=count_top_k)[0]
+                                count_top_k=count_top_k,
+                                top_k_roles=top_k_roles,
+                                relation_pair_cap=relation_pair_cap)[0]
 
     @torch.inference_mode()
     def batch_score(
@@ -208,8 +214,29 @@ class RawScorer:
         batch_size: Optional[int] = None,
         max_len: Optional[int] = None,
         count_top_k: int = 2,
-    ) -> List[ScoreLattice]:
-        """Score documents, using exactly one encoder pass for each model batch."""
+        top_k_roles: Optional[int] = None,
+        relation_pair_cap: Optional[int] = None,
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+    ) -> List[Any]:
+        """Score documents, using exactly one encoder pass for each model batch.
+
+        Args:
+            texts: Input texts.
+            schemas: One schema for every text, or one per text.
+            batch_size: Texts per encoder pass; ignored with ``hidden_states``.
+            max_len: Optional word-token cap per text.
+            count_top_k: Count hypotheses kept per span task.
+            top_k_roles: Optional per-role candidate cap (boundary only).
+            relation_pair_cap: Optional relation pair cap (boundary only).
+            hidden_states: Optional precomputed encoder output, one tensor per
+                text; all texts then collate as one batch.
+
+        Returns:
+            One score lattice or candidate score set per text.
+
+        Raises:
+            ValueError: On a non-positive control or a count mismatch.
+        """
         texts = list(texts)
         if not texts:
             return []
@@ -223,11 +250,31 @@ class RawScorer:
         size = 8 if batch_size is None else batch_size
         if size <= 0:
             raise ValueError("batch_size must be positive")
+        if hidden_states is not None:
+            if len(hidden_states) != len(texts):
+                raise ValueError("hidden_states must have the same length as texts")
+            size = len(texts)
         if count_top_k <= 0:
             raise ValueError("count_top_k must be positive")
+        if top_k_roles is not None and top_k_roles <= 0:
+            raise ValueError("top_k_roles must be positive")
+        if relation_pair_cap is not None and relation_pair_cap <= 0:
+            raise ValueError("relation_pair_cap must be positive")
         effective_max_len = max_len
 
         self.eval()
+        if getattr(self.model, "architecture", None) == "boundary":
+            return self._batch_score_boundary(
+                texts,
+                schema_list,
+                schema_dicts,
+                batch_size=size,
+                max_len=effective_max_len,
+                top_k_roles=top_k_roles,
+                relation_pair_cap=relation_pair_cap,
+                hidden_states=hidden_states,
+            )
+
         results: List[ScoreLattice] = []
         for offset in range(0, len(texts), size):
             chunk_texts = texts[offset:offset + size]
@@ -239,9 +286,7 @@ class RawScorer:
                 self.device,
                 self.dtype if self.dtype != torch.float32 else None,
             )
-            encoded = self.model.encoder(
-                input_ids=batch.input_ids, attention_mask=batch.attention_mask
-            ).last_hidden_state
+            encoded = self.model.encode_tokens(batch, hidden_states)
             token_embs, schema_embs = self.processor.extract_embeddings_from_batch(
                 encoded, batch.input_ids, batch
             )
@@ -256,6 +301,373 @@ class RawScorer:
                     count_top_k,
                 ))
         return results
+
+    def _batch_score_boundary(
+        self,
+        texts: Sequence[str],
+        schema_list: Sequence[Any],
+        schema_dicts: Sequence[Mapping[str, Any]],
+        *,
+        batch_size: int,
+        max_len: Optional[int],
+        top_k_roles: Optional[int],
+        relation_pair_cap: Optional[int],
+        hidden_states: Optional[Sequence[torch.Tensor]] = None,
+    ) -> List[Any]:
+        """Score boundary checkpoints into architecture-neutral sparse sets."""
+        results: List[Any] = []
+        for offset in range(0, len(texts), batch_size):
+            chunk_texts = list(texts[offset:offset + batch_size])
+            chunk_schemas = list(
+                schema_dicts[offset:offset + batch_size]
+            )
+            batch = self.processor.collate_fn_inference(
+                list(zip(chunk_texts, chunk_schemas)),
+                max_len=max_len,
+                architecture="boundary",
+            )
+            batch = batch.to(
+                self.device,
+                self.dtype if self.dtype != torch.float32 else None,
+            )
+            core = self.model._encode_core(batch, hidden_states=hidden_states)
+            output = self.model.boundary_head(
+                core["text_states"],
+                core["text_mask"],
+                core["query_states"],
+                core["query_mask"],
+                return_candidates=True,
+            )
+            for local_index, caller_text in enumerate(chunk_texts):
+                results.append(
+                    self._build_boundary_score_set(
+                        caller_text,
+                        schema_list[offset + local_index],
+                        batch,
+                        local_index,
+                        core,
+                        output.candidates,
+                        top_k_roles,
+                        relation_pair_cap,
+                    )
+                )
+        return results
+
+    def _build_boundary_score_set(
+        self,
+        caller_text: str,
+        original_schema: Any,
+        batch: Any,
+        index: int,
+        core: Mapping[str, Any],
+        candidates: Any,
+        top_k_roles: Optional[int],
+        relation_pair_cap: Optional[int],
+    ) -> Any:
+        from gliner2.joint_ie.candidate_scores import (
+            MentionScore,
+            ScoredRelationEdge,
+            boundary_candidates_to_candidate_score_set,
+        )
+
+        starts_all = list(batch.start_mappings[index])
+        ends_all = list(batch.end_mappings[index])
+        caller_token_count = len(starts_all)
+        while (
+            caller_token_count
+            and starts_all[caller_token_count - 1] >= len(caller_text)
+        ):
+            caller_token_count -= 1
+        starts = tuple(starts_all[:caller_token_count])
+        ends = tuple(ends_all[:caller_token_count])
+        token_offset = int(core["word_offsets"][index])
+        compiled_entity_specs = getattr(original_schema, "entity_specs", {})
+        entity_thresholds = {
+            name: getattr(spec, "threshold", None)
+            for name, spec in compiled_entity_specs.items()
+        }
+        entity_candidate_thresholds = {
+            name: getattr(spec, "candidate_threshold", None)
+            for name, spec in compiled_entity_specs.items()
+        }
+
+        extra_mentions: List[MentionScore] = []
+        relation_edges: List[ScoredRelationEdge] = []
+        if (
+            getattr(self.model, "enable_relations", False)
+            and core["rel_specs"][index]
+            and candidates is not None
+        ):
+            extra_mentions, relation_edges = self._score_boundary_relations(
+                original_schema,
+                index,
+                core,
+                candidates,
+                token_offset,
+                caller_token_count,
+                entity_thresholds,
+                entity_candidate_thresholds,
+                top_k_roles,
+                relation_pair_cap,
+            )
+
+        return boundary_candidates_to_candidate_score_set(
+            caller_text,
+            candidates,
+            core["ext_specs"][index],
+            sample_index=index,
+            token_offset=token_offset,
+            text_length=caller_token_count,
+            pair_temperature=self.model.boundary_settings.pair_temperature,
+            entity_thresholds=entity_thresholds,
+            entity_candidate_thresholds=entity_candidate_thresholds,
+            extra_mentions=extra_mentions,
+            edges=relation_edges,
+            text_tokens=tuple(batch.text_tokens[index][:caller_token_count]),
+            start_mappings=starts,
+            end_mappings=ends,
+            metadata={
+                "architecture": "boundary",
+                "processed_text": batch.original_texts[index],
+                "schema": original_schema,
+            },
+        )
+
+    def _score_boundary_relations(
+        self,
+        compiled_schema: Any,
+        sample_index: int,
+        core: Mapping[str, Any],
+        candidates: Any,
+        token_offset: int,
+        text_length: int,
+        entity_thresholds: Mapping[str, Optional[float]],
+        entity_candidate_thresholds: Mapping[str, Optional[float]],
+        top_k_roles: Optional[int],
+        relation_pair_cap: Optional[int],
+    ) -> Tuple[List[Any], List[Any]]:
+        """Score sparse relation pairs and their typed entity endpoints."""
+        from gliner2.joint_ie.candidate_scores import (
+            MentionScore,
+            ScoredRelationEdge,
+        )
+        from gliner2.models.base import QueryLayout
+        from gliner2.models.boundary.relations import RelationTypeSpec
+
+        relation_entries = core["rel_specs"][sample_index]
+        compiled_relation_specs = getattr(
+            compiled_schema, "relation_specs", {}
+        )
+        routed_specs = []
+        for entry in relation_entries:
+            route = entry["spec"]
+            compiled = compiled_relation_specs.get(route.relation_type)
+            routed_specs.append(
+                RelationTypeSpec(
+                    relation_type=route.relation_type,
+                    head_query_ids=route.head_query_ids,
+                    tail_query_ids=route.tail_query_ids,
+                    allow_self=bool(
+                        getattr(compiled, "allow_self", route.allow_self)
+                    ),
+                )
+            )
+        sample_candidates = self.model._single_sample_candidates(
+            candidates, sample_index
+        )
+        generator = self.model.relation_pair_generator
+        if top_k_roles is not None or relation_pair_cap is not None:
+            from gliner2.models.boundary.relations import (
+                TypedRelationPairGenerator,
+            )
+
+            settings = generator.settings
+            generator = TypedRelationPairGenerator(replace(
+                settings,
+                heads_per_relation=(
+                    min(settings.heads_per_relation, top_k_roles)
+                    if top_k_roles is not None
+                    else settings.heads_per_relation
+                ),
+                tails_per_relation=(
+                    min(settings.tails_per_relation, top_k_roles)
+                    if top_k_roles is not None
+                    else settings.tails_per_relation
+                ),
+                pair_cap=(
+                    min(settings.pair_cap, relation_pair_cap)
+                    if relation_pair_cap is not None
+                    else settings.pair_cap
+                ),
+            ))
+        pairs = generator.generate(
+            sample_candidates,
+            [QueryLayout(queries=())],
+            routed_specs,
+        )
+        if not len(pairs):
+            return [], []
+        relation_states = torch.stack(
+            [entry["query_state"] for entry in relation_entries]
+        ).unsqueeze(0)
+        relation_logits = self.model.relation_scorer(
+            core["text_states"][sample_index:sample_index + 1],
+            relation_states,
+            sample_candidates,
+            pairs,
+        )
+        relation_logits = (
+            relation_logits
+            / self.model.boundary_settings.relation_temperature
+        )
+
+        entity_queries = {
+            spec["field_name"]: query_id
+            for query_id, spec in enumerate(core["ext_specs"][sample_index])
+            if spec["task_type"] == "entities"
+        }
+        relation_specs = compiled_relation_specs
+        endpoint_pairs: List[Tuple[int, int]] = []
+        endpoint_requirements: set[Tuple[str, int, int]] = set()
+        for pair_index in range(len(pairs)):
+            relation_type = pairs.relation_types[pair_index]
+            relation_spec = relation_specs.get(relation_type)
+            if relation_spec is None:
+                continue
+            head = (
+                int(pairs.head_start[pair_index]),
+                int(pairs.head_end[pair_index]),
+            )
+            tail = (
+                int(pairs.tail_start[pair_index]),
+                int(pairs.tail_end[pair_index]),
+            )
+            endpoint_pairs.extend((head, tail))
+            endpoint_requirements.update(
+                (entity_type, *head)
+                for entity_type in getattr(relation_spec, "head", ())
+                if entity_type in entity_queries
+            )
+            endpoint_requirements.update(
+                (entity_type, *tail)
+                for entity_type in getattr(relation_spec, "tail", ())
+                if entity_type in entity_queries
+            )
+
+        unique_pairs = list(dict.fromkeys(endpoint_pairs))
+        entity_rows = list(entity_queries.items())
+        if not unique_pairs or not entity_rows:
+            return [], []
+        device = core["query_states"].device
+        query_ids = torch.tensor(
+            [query_id for _, query_id in entity_rows],
+            dtype=torch.long,
+            device=device,
+        )
+        explicit_pairs = torch.tensor(
+            unique_pairs, dtype=torch.long, device=device
+        )
+        explicit_indices = explicit_pairs.view(
+            1, 1, len(unique_pairs), 2
+        ).expand(1, len(entity_rows), len(unique_pairs), 2)
+        entity_logits = self.model.boundary_head.score_explicit_spans(
+            core["text_states"][sample_index:sample_index + 1],
+            core["text_mask"][sample_index:sample_index + 1],
+            core["query_states"][
+                sample_index:sample_index + 1
+            ].index_select(1, query_ids),
+            core["query_mask"][
+                sample_index:sample_index + 1
+            ].index_select(1, query_ids),
+            explicit_indices,
+        )[0] / self.model.boundary_settings.pair_temperature
+        row_by_type = {
+            entity_type: row
+            for row, (entity_type, _) in enumerate(entity_rows)
+        }
+        pair_column = {
+            pair: column for column, pair in enumerate(unique_pairs)
+        }
+        extra_mentions: List[MentionScore] = []
+        for entity_type, start, end in sorted(endpoint_requirements):
+            local_start, local_end = start - token_offset, end - token_offset
+            if not (0 <= local_start < local_end <= text_length):
+                continue
+            logit = float(
+                entity_logits[
+                    row_by_type[entity_type], pair_column[(start, end)]
+                ].detach().float()
+            )
+            threshold = entity_thresholds.get(entity_type)
+            extra_mentions.append(
+                MentionScore(
+                    query_id=entity_queries[entity_type],
+                    entity_type=entity_type,
+                    start=local_start,
+                    end=local_end,
+                    logit=logit,
+                    probability=(
+                        1.0 / (1.0 + math.exp(-logit))
+                        if logit >= 0
+                        else math.exp(logit) / (1.0 + math.exp(logit))
+                    ),
+                    threshold=0.5 if threshold is None else float(threshold),
+                    candidate_threshold=entity_candidate_thresholds.get(
+                        entity_type
+                    ),
+                )
+            )
+
+        mention_keys = {mention.key for mention in extra_mentions}
+        edges: List[ScoredRelationEdge] = []
+        for pair_index in range(len(pairs)):
+            relation_type = pairs.relation_types[pair_index]
+            relation_spec = relation_specs.get(relation_type)
+            if relation_spec is None:
+                continue
+            head_span = (
+                int(pairs.head_start[pair_index]) - token_offset,
+                int(pairs.head_end[pair_index]) - token_offset,
+            )
+            tail_span = (
+                int(pairs.tail_start[pair_index]) - token_offset,
+                int(pairs.tail_end[pair_index]) - token_offset,
+            )
+            logit = float(relation_logits[pair_index].detach().float())
+            probability = (
+                1.0 / (1.0 + math.exp(-logit))
+                if logit >= 0
+                else math.exp(logit) / (1.0 + math.exp(logit))
+            )
+            relation_threshold = getattr(relation_spec, "threshold", None)
+            for head_type in getattr(relation_spec, "head", ()):
+                head_key = (head_type, *head_span)
+                if head_key not in mention_keys:
+                    continue
+                for tail_type in getattr(relation_spec, "tail", ()):
+                    tail_key = (tail_type, *tail_span)
+                    if tail_key not in mention_keys:
+                        continue
+                    edges.append(
+                        ScoredRelationEdge(
+                            relation_type=relation_type,
+                            head=head_key,
+                            tail=tail_key,
+                            logit=logit,
+                            probability=probability,
+                            threshold=(
+                                0.5
+                                if relation_threshold is None
+                                else float(relation_threshold)
+                            ),
+                            candidate_threshold=getattr(
+                                relation_spec,
+                                "candidate_threshold",
+                                None,
+                            ),
+                        )
+                    )
+        return extra_mentions, edges
 
     def _build_lattice(
         self,
@@ -284,7 +696,18 @@ class RawScorer:
             document_start:document_start + caller_token_count
         ]
         length = document_tokens.shape[0]
-        width = self.model.max_width
+        direct_scorer = getattr(getattr(self.model, "span_rep", None), "score_queries", None)
+        dense_rep = None
+        if direct_scorer is not None and hasattr(self.model, "max_width"):
+            width = self.model.max_width
+        else:
+            # Compatibility for lightweight/custom span models that only
+            # implement the historical dense representation hook. Production
+            # span models take the direct factorized path below.
+            dense_rep = self.model.compute_span_rep_batched([document_tokens])[0][
+                "span_rep"
+            ][:length]
+            width = dense_rep.shape[1]
         row = torch.arange(length, device=document_tokens.device).unsqueeze(1)
         col = torch.arange(width, device=document_tokens.device).unsqueeze(0)
         dense_ends = row + col
@@ -349,10 +772,18 @@ class RawScorer:
 
         direct_logits = None
         if query_chunks and length > 0:
-            queries = torch.cat(query_chunks, dim=0).unsqueeze(0)
-            direct_logits = self.model.span_rep.score_queries(
-                document_tokens.unsqueeze(0), queries, mask_invalid=True
-            )[0]
+            queries = torch.cat(query_chunks, dim=0)
+            if dense_rep is None:
+                direct_logits = direct_scorer(
+                    document_tokens.unsqueeze(0),
+                    queries.unsqueeze(0),
+                    mask_invalid=True,
+                )[0]
+            else:
+                direct_logits = torch.einsum("lkh,qh->qlk", dense_rep, queries)
+                direct_logits = direct_logits.masked_fill(
+                    ~valid.unsqueeze(0), -torch.inf
+                )
 
         tasks: List[TaskLattice] = []
         for task_index, tokens, task_type, fields, hypothesis_specs in task_specs:

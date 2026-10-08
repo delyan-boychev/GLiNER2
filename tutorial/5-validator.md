@@ -5,9 +5,9 @@ Regex validators filter extracted spans to ensure they match expected patterns, 
 ## Quick Start
 
 ```python
-from gliner2 import GLiNER2, RegexValidator
+from gliner2 import AutoExtractor, RegexValidator
 
-extractor = GLiNER2.from_pretrained("your-model")
+extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Create validator and apply to field
 email_validator = RegexValidator(r"^[\w\.-]+@[\w\.-]+\.\w+$")

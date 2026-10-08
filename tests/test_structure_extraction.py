@@ -5,7 +5,11 @@ This test demonstrates the new API features for structured data extraction.
 """
 
 import json
+import pytest
 from gliner2 import GLiNER2
+
+
+pytestmark = [pytest.mark.slow, pytest.mark.quality]
 
 
 def test_structure_extraction():
@@ -41,24 +45,28 @@ def test_structure_extraction():
     print("-" * 40)
     result = model.extract(text, schema)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_announcement"), list)
     
     # Test 2: With confidence scores
     print("\n2. WITH CONFIDENCE SCORES")
     print("-" * 40)
     result = model.extract(text, schema, include_confidence=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_announcement"), list)
     
     # Test 3: With span positions
     print("\n3. WITH SPAN POSITIONS")
     print("-" * 40)
     result = model.extract(text, schema, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_announcement"), list)
     
     # Test 4: With both confidence and spans
     print("\n4. WITH CONFIDENCE AND SPAN POSITIONS")
     print("-" * 40)
     result = model.extract(text, schema, include_confidence=True, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_announcement"), list)
     
     # Test 5: Verify character positions
     print("\n5. VERIFY CHARACTER POSITIONS")
@@ -70,6 +78,7 @@ def test_structure_extraction():
                 extracted_text = text[value["start"]:value["end"]]
                 print(f"  '{value['text']}' at [{value['start']}:{value['end']}]")
                 print(f"  Verification: '{extracted_text}' - Match: {extracted_text == value['text']}")
+                assert extracted_text == value["text"]
     
     print("\n" + "=" * 80)
     print("Structure extraction tests completed!")
@@ -108,18 +117,21 @@ def test_structure_with_single_values():
     print("-" * 40)
     result = model.extract(text, schema, include_confidence=True, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_info"), list)
     
     # Test 2: Only spans (no confidence)
     print("\n2. WITH SPAN POSITIONS ONLY")
     print("-" * 40)
     result = model.extract(text, schema, include_spans=True)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_info"), list)
     
     # Test 3: Basic (no metadata)
     print("\n3. BASIC (text only)")
     print("-" * 40)
     result = model.extract(text, schema)
     print(json.dumps(result, indent=2))
+    assert isinstance(result.get("product_info"), list)
     
     print("\n" + "=" * 80)
     print("Single-value structure tests completed!")
@@ -158,6 +170,8 @@ def test_batch_structure_extraction():
         texts, schema, batch_size=2,
         include_confidence=True, include_spans=True
     )
+    assert len(results) == len(texts)
+    assert all(isinstance(result.get("product_launch"), list) for result in results)
     
     for i, (text, result) in enumerate(zip(texts, results)):
         print(f"\nText {i+1}: {text}")

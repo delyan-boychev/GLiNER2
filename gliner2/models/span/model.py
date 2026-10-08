@@ -24,23 +24,27 @@ if TYPE_CHECKING:
     from peft import PeftModel
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 from gliner2.layers import CountLSTMoE, CountLSTM, create_mlp, CountLSTMv2, SpanRepLayer
-from gliner2.processor import SchemaTransformer, PreprocessedBatch, SamplingConfig
-from safetensors.torch import save_file, load_file
-from transformers import (
-    PretrainedConfig,
-    AutoConfig,
-    AutoTokenizer,
-)
+from gliner2.processor import SchemaTransformer, PreprocessedBatch
+from safetensors.torch import save_file
+from transformers import AutoConfig
 
 # ``ExtractorConfig`` lives in ``gliner2.configuration`` so both span and
 # boundary architectures share one validated config.
 from gliner2.configuration import ExtractorConfig
-from gliner2.models.base import BaseExtractorModel
+from gliner2.models.base import BaseExtractorModel, load_extractor_tokenizer
+from gliner2.models.loading import (
+    apply_post_load_options,
+    checkpoint_file,
+    load_checkpoint_state_dict,
+    pop_attention_backend,
+    pop_disentangled_flash_options,
+    reconcile_encoder_embeddings,
+    split_load_kwargs,
+)
 
 
 class SpanExtractorModel(BaseExtractorModel):
@@ -67,7 +71,14 @@ class SpanExtractorModel(BaseExtractorModel):
         """Names of task-specific (non-encoder) submodules for LoRA targeting."""
         return ("span_rep", "classifier", "count_embed", "count_pred")
 
-    def __init__(self, config: ExtractorConfig, encoder_config=None, tokenizer=None):
+    def __init__(
+        self,
+        config: ExtractorConfig,
+        encoder_config=None,
+        tokenizer=None,
+        use_flashdeberta: Optional[bool] = None,
+        word_splitter=None,
+    ):
         super().__init__(config)
         self.config = config
         self.max_width = config.max_width
@@ -76,12 +87,14 @@ class SpanExtractorModel(BaseExtractorModel):
         if tokenizer is not None:
             self.processor = SchemaTransformer(
                 tokenizer=tokenizer,
-                token_pooling=config.token_pooling
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
             )
         else:
             self.processor = SchemaTransformer(
                 config.model_name,
-                token_pooling=config.token_pooling
+                token_pooling=config.token_pooling,
+                word_splitter=word_splitter,
             )
 
         # Load encoder
@@ -89,6 +102,7 @@ class SpanExtractorModel(BaseExtractorModel):
             config.model_name,
             encoder_config,
             getattr(config, "attn_implementation", "sdpa"),
+            use_flashdeberta=use_flashdeberta,
         )
 
         self.encoder.resize_token_embeddings(len(self.processor.tokenizer))
@@ -142,13 +156,12 @@ class SpanExtractorModel(BaseExtractorModel):
         self._print_config(config)
 
     def _print_config(self, config):
-        print("=" * 60)
-        print("🧠 Model Configuration")
-        print("=" * 60)
-        print(f"Encoder model      : {config.model_name}")
-        print(f"Counting layer     : {config.counting_layer}")
-        print(f"Token pooling      : {config.token_pooling}")
-        print("=" * 60)
+        logger.info(
+            "Model configuration: encoder=%s counting_layer=%s token_pooling=%s",
+            config.model_name,
+            config.counting_layer,
+            config.token_pooling,
+        )
 
     # =========================================================================
     # Main Forward Pass
@@ -789,6 +802,15 @@ class SpanExtractorModel(BaseExtractorModel):
             compile: If True, torch.compile the encoder and span-rep
                 with ``dynamic=True`` for fused GPU kernels.
             map_location: Device to load the model onto (e.g. "cpu", "cuda").
+            attention_backend: Encoder attention implementation: ``"standard"``,
+                ``"flashdeberta"``, or ``"disentangled_flash"``.
+            use_flashdeberta: Compatibility alias for selecting
+                ``"flashdeberta"`` or ``"standard"``. If both backend options
+                are omitted, defer to the ``USE_FLASHDEBERTA`` environment
+                variable.
+            word_splitter: Built-in splitter name (``"whitespace"`` default,
+                or ``"char"``) or a custom callable. Runtime-only; saved
+                checkpoints reload with the default unless supplied again.
             **kwargs: Additional keyword arguments.
 
         To use a LoRA adapter:
@@ -799,50 +821,52 @@ class SpanExtractorModel(BaseExtractorModel):
             model = Extractor.from_pretrained("base-model-name")
             model.load_adapter("path/to/adapter")
         """
-        from huggingface_hub import hf_hub_download
-
-        quantize = kwargs.pop("quantize", False)
-        compile_model = kwargs.pop("compile", False)
-        map_location = kwargs.pop("map_location", None)
         config = kwargs.pop("config", None)
-
-        def download_or_local(repo, filename):
-            if os.path.isdir(repo):
-                return os.path.join(repo, filename)
-            return hf_hub_download(repo, filename)
+        model_options, hub_kwargs = split_load_kwargs(
+            kwargs, context=f"{cls.__name__}.from_pretrained"
+        )
+        quantize = model_options.pop("quantize", False)
+        compile_model = model_options.pop("compile", False)
+        map_location = model_options.pop("map_location", None)
+        attention_backend, use_flashdeberta = pop_attention_backend(
+            model_options
+        )
+        disentangled_flash_options = pop_disentangled_flash_options(model_options)
+        word_splitter = model_options.pop("word_splitter", None)
 
         if config is None:
-            config_path = download_or_local(repo_or_dir, "config.json")
+            config_path = checkpoint_file(repo_or_dir, "config.json", hub_kwargs)
             config = cls.config_class.from_pretrained(config_path)
 
-        encoder_config_path = download_or_local(repo_or_dir, "encoder_config/config.json")
+        encoder_config_path = checkpoint_file(
+            repo_or_dir, "encoder_config/config.json", hub_kwargs
+        )
         encoder_config = AutoConfig.from_pretrained(encoder_config_path)
 
-        tokenizer = AutoTokenizer.from_pretrained(repo_or_dir)
-        model = cls(config, encoder_config=encoder_config, tokenizer=tokenizer)
+        tokenizer_source = repo_or_dir
+        if os.path.isdir(str(repo_or_dir)) and hub_kwargs.get("subfolder"):
+            tokenizer_source = os.path.join(
+                str(repo_or_dir), str(hub_kwargs["subfolder"])
+            )
+        tokenizer = load_extractor_tokenizer(tokenizer_source)
+        model = cls(
+            config,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            use_flashdeberta=use_flashdeberta,
+            word_splitter=word_splitter,
+        )
 
-        # Load weights
+        state_dict = load_checkpoint_state_dict(repo_or_dir, hub_kwargs)
+        reconcile_encoder_embeddings(model, state_dict)
         try:
-            model_path = download_or_local(repo_or_dir, "model.safetensors")
-            state_dict = load_file(model_path)
-        except Exception:
-            model_path = download_or_local(repo_or_dir, "pytorch_model.bin")
-            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-
-        # Handle embedding size mismatch
-        try:
-            saved_emb = state_dict["encoder.embeddings.word_embeddings.weight"]
-            model_emb = model.encoder.embeddings.word_embeddings.weight
-            if saved_emb.shape[0] != model_emb.shape[0]:
-                extra = model_emb.shape[0] - saved_emb.shape[0]
-                state_dict["encoder.embeddings.word_embeddings.weight"] = torch.cat([
-                    saved_emb,
-                    torch.randn(extra, saved_emb.shape[1]) * 0.02
-                ], dim=0)
-        except KeyError:
-            pass
-
-        model.load_state_dict(state_dict)
+            model.load_state_dict(state_dict)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Checkpoint at {repo_or_dir!r} does not match this model's "
+                "span-head configuration. Ensure max_width, counting_layer, "
+                f"and encoder settings match. Original error:\n{exc}"
+            ) from exc
 
         # Mirror HF PreTrainedModel.from_pretrained semantics so downstream
         # PEFT saves derive ``base_model_name_or_path`` correctly. PEFT reads
@@ -854,16 +878,14 @@ class SpanExtractorModel(BaseExtractorModel):
         model.config._name_or_path = repo_or_dir
         model.name_or_path = repo_or_dir
 
-        if map_location is not None:
-            model = model.to(map_location)
-
-        if quantize:
-            model.quantize()
-
-        if compile_model:
-            model.compile()
-
-        return model
+        return apply_post_load_options(
+            model,
+            map_location=map_location,
+            quantize=quantize,
+            compile_model=compile_model,
+            attention_backend=attention_backend,
+            disentangled_flash_options=disentangled_flash_options,
+        )
 
     # =========================================================================
     # Quantization
@@ -955,8 +977,8 @@ class SpanExtractorModel(BaseExtractorModel):
         Returns:
             PeftModel wrapping this Extractor.
         """
-        from peft import LoraConfig as PeftLoraConfig, get_peft_model
         from gliner2.training.lora import _resolve_targets, _cast_lora_dtype
+        from peft import LoraConfig as PeftLoraConfig, get_peft_model
 
         # Pin ``base_model_name_or_path`` up front so adapters saved via
         # ``PeftModel.save_pretrained`` always carry a concrete identifier

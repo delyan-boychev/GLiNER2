@@ -2,6 +2,8 @@
 
 Learn how to extract relations between entities from text using GLiNER2's relation extraction capabilities.
 
+This tutorial covers **independent** relation decoding (`extract_relations`). When you need typed endpoints, uniqueness, or globally consistent graphs, use [Joint Information Extraction](15-joint_ie.md) on a GLiNER2.5 checkpoint with `enable_relations=True`.
+
 ## Table of Contents
 - [Basic Relation Extraction](#basic-relation-extraction)
 - [Multiple Relation Types](#multiple-relation-types)
@@ -17,10 +19,9 @@ Learn how to extract relations between entities from text using GLiNER2's relati
 ### Simple Example
 
 ```python
-from gliner2 import GLiNER2
+from gliner2 import AutoExtractor
 
-# Load model
-extractor = GLiNER2.from_pretrained("your-model-name")
+extractor = AutoExtractor.from_pretrained("fastino/gliner2.5-base-v1")
 
 # Extract relations
 text = "John works for Apple Inc. and lives in San Francisco."

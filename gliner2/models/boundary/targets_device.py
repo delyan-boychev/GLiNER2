@@ -11,10 +11,23 @@ def dense_targets_from_pairs(
     text_length: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build exact start/end/inside targets on the pairs' device."""
+    if pairs.shape[:-1] != mask.shape or pairs.shape[-1] != 2:
+        raise ValueError(
+            f"pairs {tuple(pairs.shape)} and mask {tuple(mask.shape)} "
+            "are incompatible"
+        )
+    if text_length < 0:
+        raise ValueError("text_length must be non-negative")
     b, q = pairs.shape[:2]
-    weights = mask.to(torch.float32)
-    starts = pairs[..., 0].masked_fill(~mask, 0)
-    ends = pairs[..., 1].masked_fill(~mask, 0)
+    valid = (
+        mask
+        & (pairs[..., 0] >= 0)
+        & (pairs[..., 1] > pairs[..., 0])
+        & (pairs[..., 1] <= text_length)
+    )
+    weights = valid.to(torch.float32)
+    starts = pairs[..., 0].masked_fill(~mask, 0).clamp(0, text_length)
+    ends = pairs[..., 1].masked_fill(~mask, 0).clamp(0, text_length)
 
     start_targets = torch.zeros(
         b, q, text_length + 1, dtype=torch.float32, device=pairs.device

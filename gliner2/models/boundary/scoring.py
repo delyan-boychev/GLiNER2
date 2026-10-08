@@ -43,6 +43,9 @@ def interval_prefix_score(
 
     ``prefix`` is ``[B, Q, L+1]``. Returns ``[B, Q, C]``.
     """
+    max_idx = prefix.shape[2] - 1
+    starts = starts.clamp(0, max_idx)
+    ends = ends.clamp(0, max_idx)
     p_end = torch.gather(prefix, 2, ends)
     p_start = torch.gather(prefix, 2, starts)
     interval = p_end - p_start
@@ -217,8 +220,10 @@ class SparseBoundaryPairScorer(nn.Module):
             compat = compat + self.endpoint_difference_projection(difference).squeeze(-1)
 
         # Start/end marginals gathered at the candidate boundaries (added once).
-        a = torch.gather(start_logits, 2, starts)
-        bmarg = torch.gather(end_logits, 2, ends)
+        max_s = start_logits.shape[2] - 1
+        max_e = end_logits.shape[2] - 1
+        a = torch.gather(start_logits, 2, starts.clamp(0, max_s))
+        bmarg = torch.gather(end_logits, 2, ends.clamp(0, max_e))
 
         # Prior is the proposer's marginal-free compatibility so marginals are
         # not double-counted. Fall back to the (masked) full prior only if a
@@ -249,7 +254,9 @@ class SparseBoundaryPairScorer(nn.Module):
             interval = interval_prefix_score(
                 inside_prefix, starts, ends, inside_prefix_mean
             ).to(score.dtype)
-            denom = torch.sqrt((ends - starts).clamp(min=1).float())
+            denom = torch.sqrt(
+                (ends - starts).clamp(min=1).to(score.dtype)
+            )
             inside_weight = (
                 self.inside_weight(query_states).squeeze(-1).unsqueeze(-1)
                 if self.query_conditioned_inside_weight
@@ -260,7 +267,7 @@ class SparseBoundaryPairScorer(nn.Module):
         # Length features.
         feats = continuous_length_features(starts, ends, text_lengths)     # [B,Q,C,3]
         length_coeff = self.length_query_projection(query_states).unsqueeze(2)  # [B,Q,1,3]
-        length_score = (feats * length_coeff).sum(-1)                      # [B,Q,C]
+        length_score = (feats.to(length_coeff.dtype) * length_coeff).sum(-1)  # [B,Q,C]
         score = score + length_score
 
         return mask_invalid_candidate_logits(score, valid)

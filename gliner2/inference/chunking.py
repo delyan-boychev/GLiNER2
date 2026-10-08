@@ -7,20 +7,12 @@ merge duplicate predictions produced by overlapping chunks.
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-
-_WORD_PATTERN = re.compile(
-    r"""(?:https?://[^\s]+|www\.[^\s]+)
-    |[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
-    |@[a-z0-9_]+
-    |\w+(?:[-_]\w+)*
-    |\S""",
-    re.VERBOSE | re.IGNORECASE,
-)
+from gliner2.inference.overlap import normalize_overlap_policy, resolve_overlaps
+from gliner2.processing.word_splitter import resolve_word_splitter
 
 
 @dataclass(frozen=True)
@@ -34,22 +26,25 @@ class TextChunk:
     end_word: int
 
 
-def iter_word_offsets(text: str) -> Iterable[Tuple[str, int, int]]:
-    """Yield regex word tokens and character offsets using processor-compatible rules.
+def iter_word_offsets(
+    text: str,
+    word_splitter=None,
+) -> Iterable[Tuple[str, int, int]]:
+    """Yield word tokens and character offsets using the active splitter.
 
-    The regex is matched against the original text (it is already case-insensitive)
-    so that the reported offsets index the caller's string. Lower-casing before
-    matching is unsafe because Unicode case folding can change string length
-    (e.g. ``"İ".lower()`` expands to two code points), which would shift offsets.
+    ``word_splitter`` may be a built-in name, a callable, or omitted to use
+    the default whitespace splitter. Offsets always index the original text;
+    chunking requests original-case token strings (``lower=False``).
     """
-    for match in _WORD_PATTERN.finditer(text):
-        yield match.group(), match.start(), match.end()
+    splitter = resolve_word_splitter(word_splitter)
+    yield from splitter(text, lower=False)
 
 
 def split_text_into_chunks(
     text: str,
     chunk_size: int = 384,
     chunk_overlap: int = 64,
+    word_splitter=None,
 ) -> List[TextChunk]:
     """Split text into overlapping word windows.
 
@@ -57,6 +52,7 @@ def split_text_into_chunks(
         text: Original document text.
         chunk_size: Maximum number of word tokens per chunk.
         chunk_overlap: Number of word tokens repeated between adjacent chunks.
+        word_splitter: Optional splitter name or callable used to count words.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than 0")
@@ -65,7 +61,7 @@ def split_text_into_chunks(
     if chunk_overlap >= chunk_size:
         raise ValueError("chunk_overlap must be smaller than chunk_size")
 
-    tokens = list(iter_word_offsets(text))
+    tokens = list(iter_word_offsets(text, word_splitter=word_splitter))
     if not tokens:
         return [TextChunk(text=text, start_char=0, end_char=len(text), start_word=0, end_word=0)]
 
@@ -119,6 +115,7 @@ def merge_chunk_results(
     include_confidence: bool = False,
     include_spans: bool = False,
     scalar_entity_labels: Optional[Iterable[str]] = None,
+    overlap_policy: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Merge formatted extraction results from one document's chunks.
 
@@ -129,18 +126,20 @@ def merge_chunk_results(
     if len(chunks) != len(chunk_results):
         raise ValueError("chunks and chunk_results must have the same length")
 
+    policy = normalize_overlap_policy(overlap_policy, default="disallow")
     scalar_labels = set(scalar_entity_labels or ())
     remapped_results = [
         remap_result_spans(result, original_text, chunk)
         for chunk, result in zip(chunks, chunk_results)
     ]
-    merged = _merge_result_dicts(remapped_results, scalar_labels)
+    merged = _merge_result_dicts(remapped_results, scalar_labels, policy)
     return _strip_span_metadata(merged, include_confidence, include_spans)
 
 
 def _merge_result_dicts(
     results: List[Dict[str, Any]],
     scalar_entity_labels: Optional[set] = None,
+    overlap_policy: str = "disallow",
 ) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
     keys = []
@@ -154,16 +153,22 @@ def _merge_result_dicts(
     for key in keys:
         values = [result.get(key) for result in results if key in result]
         if key == "entities":
-            merged[key] = _merge_entity_maps(values, scalar_entity_labels or set())
+            merged[key] = _merge_entity_maps(
+                values, scalar_entity_labels or set(), overlap_policy
+            )
         elif key == "relation_extraction":
             merged[key] = _merge_relation_maps(values)
         else:
-            merged[key] = _merge_values(values)
+            merged[key] = _merge_values(values, overlap_policy)
 
     return merged
 
 
-def _merge_entity_maps(values: List[Any], scalar_labels: set) -> Dict[str, Any]:
+def _merge_entity_maps(
+    values: List[Any],
+    scalar_labels: set,
+    overlap_policy: str,
+) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
     labels = []
     seen = set()
@@ -180,7 +185,7 @@ def _merge_entity_maps(values: List[Any], scalar_labels: set) -> Dict[str, Any]:
         for value in values:
             if isinstance(value, dict) and label in value:
                 items.extend(_as_list(value[label]))
-        deduped = _dedupe_items(items, remove_overlaps=True)
+        deduped = _dedupe_items(items, overlap_policy=overlap_policy)
         if label in scalar_labels:
             # A non-list entity dtype yields a single best value (or None),
             # matching the base engine's scalar contract.
@@ -208,12 +213,12 @@ def _merge_relation_maps(values: List[Any]) -> Dict[str, List[Any]]:
         for value in values:
             if isinstance(value, dict) and label in value:
                 items.extend(_as_list(value[label]))
-        merged[label] = _dedupe_items(items, remove_overlaps=False)
+        merged[label] = _dedupe_items(items)
 
     return merged
 
 
-def _merge_values(values: List[Any]) -> Any:
+def _merge_values(values: List[Any], overlap_policy: str = "disallow") -> Any:
     non_empty = [value for value in values if value not in (None, {}, [])]
     if not non_empty:
         return values[0] if values else None
@@ -229,15 +234,18 @@ def _merge_values(values: List[Any]) -> Any:
         items: List[Any] = []
         for value in non_empty:
             items.extend(value)
-        return _dedupe_items(items, remove_overlaps=False)
+        return _dedupe_items(items, overlap_policy=overlap_policy)
 
     if all(isinstance(value, dict) for value in non_empty):
-        return _merge_nested_dicts(non_empty)
+        return _merge_nested_dicts(non_empty, overlap_policy)
 
     return non_empty[0]
 
 
-def _merge_nested_dicts(values: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _merge_nested_dicts(
+    values: List[Dict[str, Any]],
+    overlap_policy: str = "disallow",
+) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
     keys = []
     seen = set()
@@ -248,28 +256,38 @@ def _merge_nested_dicts(values: List[Dict[str, Any]]) -> Dict[str, Any]:
                 keys.append(key)
 
     for key in keys:
-        merged[key] = _merge_values([value.get(key) for value in values if key in value])
+        merged[key] = _merge_values(
+            [value.get(key) for value in values if key in value],
+            overlap_policy,
+        )
     return merged
 
 
-def _dedupe_items(items: List[Any], remove_overlaps: bool) -> List[Any]:
+def _dedupe_items(
+    items: List[Any],
+    overlap_policy: Optional[str] = None,
+) -> List[Any]:
     span_items = [item for item in items if _is_span_dict(item)]
     other_items = [item for item in items if not _is_span_dict(item)]
 
     deduped: List[Any] = []
     if span_items:
-        sorted_spans = sorted(span_items, key=lambda item: item.get("confidence", 0.0), reverse=True)
-        selected: List[Dict[str, Any]] = []
-        seen_spans = set()
-        for item in sorted_spans:
-            key = _span_key(item)
-            if key in seen_spans:
-                continue
-            if remove_overlaps and any(_spans_overlap(item, existing) for existing in selected):
-                continue
-            seen_spans.add(key)
-            selected.append(item)
-        deduped.extend(sorted(selected, key=lambda item: (item["start"], item["end"], item.get("text", ""))))
+        selected = resolve_overlaps(
+            span_items,
+            overlap_policy,
+            default="allow",
+            score=lambda item: float(item.get("confidence", 0.0)),
+            start=lambda item: int(item["start"]),
+            end=lambda item: int(item["end"]),
+        )
+        deduped.extend(
+            sorted(
+                selected,
+                key=lambda item: (
+                    item["start"], item["end"], item.get("text", "")
+                ),
+            )
+        )
 
     # Non-span items (relations, structure instances, classification dicts) are
     # deduplicated on a confidence-insensitive canonical key so that the same

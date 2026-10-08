@@ -15,6 +15,7 @@ from gliner2.training.trainer import GLiNER2Trainer, TrainingConfig
 class _TrainerStubModel:
     def __init__(self):
         self.to = Mock(return_value=self)
+        self.float = Mock(return_value=self)
         self.processor = Mock()
 
 
