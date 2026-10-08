@@ -373,6 +373,7 @@ class SchemaTransformer:
         max_gold_per_query: int = 32,
         on_capacity_exceeded: str = "raise",
         ignore_missing_entities: bool = False,
+        dedupe_contained_entity_spans: bool = True,
     ) -> PreprocessedBatch:
         """
         Collate function for training DataLoader.
@@ -395,6 +396,13 @@ class SchemaTransformer:
                 (default, recommended for training) propagates the error;
                 ``"skip"`` omits the offending record; ``"fallback"`` inserts a
                 minimal dummy record (legacy compatibility behavior).
+            dedupe_contained_entity_spans: When ``True`` (default), filter an
+                entity query's independently re-searched listed-value matches
+                down to the maximal, non-contained spans before they become
+                gold mentions -- see
+                ``gliner2.processing.boundary_preprocessing._dedupe_contained_spans``.
+                Only affects ``architecture="boundary"``; only affects entity
+                queries. Set ``False`` to restore the pre-fix behavior.
 
         Returns:
             PreprocessedBatch ready for model.forward()
@@ -410,6 +418,7 @@ class SchemaTransformer:
             max_gold_per_query=max_gold_per_query,
             on_capacity_exceeded=on_capacity_exceeded,
             ignore_missing_entities=ignore_missing_entities,
+            dedupe_contained_entity_spans=dedupe_contained_entity_spans,
         )
 
     def collate_fn_inference(
@@ -423,6 +432,7 @@ class SchemaTransformer:
         max_gold_per_query: int = 32,
         on_capacity_exceeded: str = "raise",
         ignore_missing_entities: bool = False,
+        dedupe_contained_entity_spans: bool = True,
     ) -> PreprocessedBatch:
         """
         Collate function for inference DataLoader.
@@ -455,6 +465,7 @@ class SchemaTransformer:
             max_gold_per_query=max_gold_per_query,
             on_capacity_exceeded=on_capacity_exceeded,
             ignore_missing_entities=ignore_missing_entities,
+            dedupe_contained_entity_spans=dedupe_contained_entity_spans,
         )
 
     @staticmethod
@@ -467,6 +478,7 @@ class SchemaTransformer:
         build_targets: Optional[bool] = None,
         on_capacity_exceeded: str = "raise",
         ignore_missing_entities: bool = False,
+        dedupe_contained_entity_spans: bool = True,
     ) -> PreprocessedBatch:
         if architecture != "boundary" or len(batch) == 0:
             return batch
@@ -491,6 +503,9 @@ class SchemaTransformer:
             build_targets=build_targets,
             on_capacity_exceeded=on_capacity_exceeded,
             ignore_missing_entities=ignore_missing_entities,
+            dedupe_contained_entity_spans=dedupe_contained_entity_spans,
+            original_texts=batch.original_texts,
+            original_schemas=batch.original_schemas,
         )
         batch.query_layouts = layouts
         batch.targets = targets
@@ -1403,6 +1418,80 @@ class SchemaTransformer:
     def _tokenize_text(self, text: str) -> List[str]:
         """Tokenize text into words."""
         return [tok for tok, _, _ in self.word_splitter(text, lower=True)]
+
+    # =========================================================================
+    # Public API: Pre-flight Alignment Check
+    # =========================================================================
+
+    def find_unalignable_entities(
+        self, text: str, entities: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Check which listed entity values fail to token-align in ``text``.
+
+        Training requires each listed entity value to be found as an exact,
+        contiguous run of *tokens* (not merely a character substring) inside
+        the tokenized text -- ``self.word_splitter``'s hyphen/underscore
+        continuation rule (see ``WhitespaceTokenSplitter``) means a value can
+        be a real character substring of ``text`` yet still fail this check,
+        e.g. ``"ABS"`` inside ``"...LEDRemote-ABS-BES3-MY2023.png..."``: the
+        tokenizer merges that whole hyphen-joined run into one token, so a
+        standalone-token search for ``"abs"`` finds nothing there.
+
+        Call this on a single ``(text, schema)`` example *before* submitting
+        it to ``collate_fn_train``, to self-diagnose annotations that would
+        otherwise surface only as a batch-relative ``ValueError`` deep inside
+        collation. It reuses the exact tokenizer (``self.word_splitter``) and
+        sublist search (``self._find_sublist``) that ``collate_fn_train`` uses
+        to build gold targets, so it can never drift from actual training
+        behavior -- a value reported here as alignable is guaranteed to align
+        during training, and vice versa.
+
+        Args:
+            text: The example's raw text, exactly as it will be passed to
+                ``collate_fn_train``/``collate_fn_inference`` (trailing
+                sentence punctuation is normalized internally, matching what
+                collation does).
+            entities: The example's ``schema["entities"]`` mapping: entity
+                type name -> a single literal listed value (``str``), or a
+                list of literal listed values for that type.
+
+        Returns:
+            A list of dicts, one per listed value that fails to token-align,
+            each with keys ``"entity_type"``, ``"value"``, and
+            ``"value_index"`` (the value's position within that type's list,
+            or ``None`` when the type's value was a single ``str`` rather
+            than a list). An empty list means every listed value aligns.
+
+        Example:
+            >>> transformer = SchemaTransformer(model_name="...")
+            >>> transformer.find_unalignable_entities(
+            ...     "See IMG Bosch-eBike-LEDRemote-ABS-BES3-MY2023.png for wiring.",
+            ...     {"PartCode": "ABS"},
+            ... )
+            [{'entity_type': 'PartCode', 'value': 'ABS', 'value_index': None}]
+        """
+        text_tokens = self._tokenize_text(self._normalize_text(text))
+        unalignable: List[Dict[str, Any]] = []
+        for entity_type, raw_value in entities.items():
+            is_list = isinstance(raw_value, list)
+            values = raw_value if is_list else [raw_value]
+            for index, value in enumerate(values):
+                if value is None or str(value) == "":
+                    continue
+                if str(value).startswith("[selection]"):
+                    # Choice-field selections align against the classification
+                    # prefix tokens, not document text; out of scope here.
+                    continue
+                matches = self._find_sublist(self._tokenize_text(str(value)), text_tokens)
+                if matches == [(-1, -1)]:
+                    unalignable.append(
+                        {
+                            "entity_type": entity_type,
+                            "value": value,
+                            "value_index": index if is_list else None,
+                        }
+                    )
+        return unalignable
 
     # =========================================================================
     # Internal: Input Formatting

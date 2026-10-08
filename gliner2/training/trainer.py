@@ -249,6 +249,11 @@ class TrainingConfig:
     # Gold-capacity overflow policy for boundary targets: "raise" (default,
     # no silent loss), "truncate_with_warning", or "skip_sample".
     on_capacity_exceeded: str = "raise"
+    # Filter an entity query's independently re-searched listed-value matches
+    # down to the maximal, non-contained spans before they become gold
+    # mentions (see boundary_preprocessing._dedupe_contained_spans). Defaults
+    # to the corrected behavior; set False to restore the pre-fix behavior.
+    dedupe_contained_entity_spans: bool = True
     group_by_length: bool = True
     length_group_window_batches: int = 50
     compile_model: bool = False
@@ -511,6 +516,7 @@ class ExtractorCollator:
             build_targets: Optional[bool] = None,
             on_capacity_exceeded: str = "raise",
             allow_invalid_samples: bool = False,
+            dedupe_contained_entity_spans: bool = True,
     ):
         self.processor = processor
         self.is_training = is_training
@@ -525,6 +531,10 @@ class ExtractorCollator:
         # skip_sample); defaults to the no-silent-loss "raise".
         self.on_capacity_exceeded = on_capacity_exceeded
         self.allow_invalid_samples = allow_invalid_samples
+        # Filter phantom contained-span entity matches (see
+        # gliner2.processing.boundary_preprocessing._dedupe_contained_spans);
+        # defaults to the corrected behavior.
+        self.dedupe_contained_entity_spans = dedupe_contained_entity_spans
 
     def __call__(self, batch: List[Tuple[str, Dict]]):
         """
@@ -541,6 +551,7 @@ class ExtractorCollator:
                 max_len=self.max_len, architecture=self.architecture,
                 max_gold_per_query=self.max_gold_per_query,
                 on_capacity_exceeded=self.on_capacity_exceeded,
+                dedupe_contained_entity_spans=self.dedupe_contained_entity_spans,
             )
             if self.allow_invalid_samples:
                 kwargs.update(
@@ -554,6 +565,7 @@ class ExtractorCollator:
                 build_targets=self.build_targets,
                 max_gold_per_query=self.max_gold_per_query,
                 on_capacity_exceeded=self.on_capacity_exceeded,
+                dedupe_contained_entity_spans=self.dedupe_contained_entity_spans,
             )
             if self.allow_invalid_samples:
                 kwargs.update(
@@ -1521,6 +1533,7 @@ class ExtractorTrainer:
             build_targets=None if is_training else True,
             on_capacity_exceeded=self.config.on_capacity_exceeded,
             allow_invalid_samples=self.config.allow_invalid_samples,
+            dedupe_contained_entity_spans=self.config.dedupe_contained_entity_spans,
         )
 
         # Fix Bug #1 & #9: Handle small datasets
