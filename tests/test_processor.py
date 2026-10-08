@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import random
+import re
 
 import pytest
 import torch
@@ -154,6 +155,53 @@ class TestWhitespaceTokenSplitter:
         tokens = list(splitter("email foo@bar.com now", lower=True))
         emails = [t[0] for t in tokens if "@" in t[0] and "." in t[0]]
         assert len(emails) == 1
+
+    @pytest.mark.parametrize(
+        "text,words",
+        [
+            ("प्रधानमंत्री नरेंद्र मोदी ने कहा।", ["प्रधानमंत्री", "नरेंद्र", "मोदी", "ने", "कहा", "।"]),
+            ("কলকাতা শহরে", ["কলকাতা", "শহরে"]),
+            ("சென்னையில் மோடி", ["சென்னையில்", "மோடி"]),
+            ("హైదరాబాద్ నగరం", ["హైదరాబాద్", "నగరం"]),
+            ("ذَهَبَ مُحَمَّدٌ", ["ذَهَبَ", "مُحَمَّدٌ"]),
+        ],
+    )
+    def test_combining_marks_stay_inside_words(self, text, words):
+        splitter = WhitespaceTokenSplitter()
+        tokens = list(splitter(text, lower=False))
+        assert [t[0] for t in tokens] == words
+        for tok, start, end in tokens:
+            assert text[start:end] == tok
+
+    def test_zero_width_joiners_stay_inside_words(self):
+        splitter = WhitespaceTokenSplitter()
+        text = "क्‍ष और र‌ा"
+        assert [t[0] for t in splitter(text, lower=False)] == ["क्‍ष", "और", "र‌ा"]
+
+    def test_decomposed_latin_accents_stay_inside_words(self):
+        splitter = WhitespaceTokenSplitter()
+        text = "Café Nguyễn"
+        assert [t[0] for t in splitter(text, lower=False)] == ["Café", "Nguyễn"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Dr. Smith-Jones met @ann at foo@bar.com, https://x.org/a?b=1 (2024)!",
+            "Größe café naïve São Paulo русский",
+            "snake_case and kebab-case-words -leading trailing- 3.14",
+        ],
+    )
+    def test_text_without_combining_marks_splits_as_before(self, text):
+        previous = re.compile(
+            r"""(?:https?://[^\s]+|www\.[^\s]+)
+            |[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}
+            |@[a-z0-9_]+
+            |\w+(?:[-_]\w+)*
+            |\S""",
+            re.VERBOSE | re.IGNORECASE,
+        )
+        expected = [(m.group().lower(), m.start(), m.end()) for m in previous.finditer(text)]
+        assert list(WhitespaceTokenSplitter()(text, lower=True)) == expected
 
 
 class TestCharLevelSplitter:
